@@ -168,6 +168,6 @@ pub fn encode_image(projector: &VisionProjector, img: &Rgb, gpu: Option<&VisionG
             }
         }
     };
-    anyhow::ensure!(feats.len() == nx * ny, "encoder returned {} tokens, expected {nx}x{ny}", feats.len(), nx, ny);
+    anyhow::ensure!(feats.len() == nx * ny, "encoder returned {} tokens, expected {nx}x{ny}", feats.len());
     Ok((feats, nx, ny))
 }
