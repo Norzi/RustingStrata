@@ -1,6 +1,7 @@
 //! Multimodal image support: CLIP projector loading, image preprocessing, the Qwen3-VL encoder and prompt
 //! position assignment.
 
+pub mod cache;
 pub mod gpu;
 pub mod image;
 pub mod mmproj;

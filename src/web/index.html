@@ -592,20 +592,37 @@ function addImage(url) {
   pendingImages.push(url);
   renderPreview();
 }
+// Downscale before sending: the model sees at most a 1280 px side (30x40 vision tokens), and the whole history goes
+// up with every request, so a 5 MB photo would bloat the body and the upload for nothing. JPEG, or the original
+// when the browser cannot decode or the file is already small.
+function readImage(f) {
+  const raw = () => new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => res(null); r.readAsDataURL(f); });
+  if (!f.type.startsWith('image/') || typeof createImageBitmap !== 'function') return raw();
+  return createImageBitmap(f).then(bmp => {
+    const s = Math.min(1, 1280 / Math.max(bmp.width, bmp.height));
+    if (s >= 1 && f.size < 1 << 20) { bmp.close?.(); return raw(); }
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(bmp.width * s));
+    c.height = Math.max(1, Math.round(bmp.height * s));
+    const ctx = c.getContext('2d');
+    // JPEG has no alpha: without a white base a transparent PNG comes out black.
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(bmp, 0, 0, c.width, c.height);
+    bmp.close?.();
+    return c.toDataURL('image/jpeg', 0.85);
+  }).catch(raw);
+}
 $('attach').onclick = () => $('file').click();
-$('file').onchange = e => {
-  for (const f of e.target.files || []) {
-    const r = new FileReader();
-    r.onload = () => addImage(r.result);
-    r.readAsDataURL(f);
-  }
+$('file').onchange = async e => {
+  for (const f of e.target.files || []) { const u = await readImage(f); if (u) addImage(u); }
   e.target.value = '';
 };
 document.addEventListener('paste', e => {
   for (const item of e.clipboardData?.items || []) {
     if (item.type.startsWith('image/')) {
       const f = item.getAsFile();
-      if (f) { const r = new FileReader(); r.onload = () => addImage(r.result); r.readAsDataURL(f); e.preventDefault(); }
+      if (f) { e.preventDefault(); readImage(f).then(u => u && addImage(u)); }
     }
   }
 });

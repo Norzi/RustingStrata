@@ -374,3 +374,24 @@ fn gemma4v_red_image_predicts_red() {
     eprintln!("generated = {text:?}");
     assert!(text.to_ascii_lowercase().contains("red"), "generated {text:?}");
 }
+
+/// The encoder cache is keyed by the projector and the image source, so a chat that resends the same data URL hits,
+/// and a different image (or projector) misses.
+#[test]
+fn vision_cache_hits_and_clears() {
+    use rusting_strata::vision::cache;
+    let (mmproj, other) = (Path::new("qwen3.6-mmproj-F16.gguf"), Path::new("other-mmproj-F16.gguf"));
+    let (a, b) = ("data:image/png;base64,AAAA", "data:image/png;base64,AAAB");
+    assert_eq!(cache::key(mmproj, a), cache::key(mmproj, a));
+    assert_ne!(cache::key(mmproj, a), cache::key(mmproj, b));
+    assert_ne!(cache::key(mmproj, a), cache::key(other, a));
+    cache::clear();
+    assert!(cache::get(cache::key(mmproj, a)).is_none());
+    let rows = vec![vec![1.0f32, 2.0, 3.0]; 3];
+    cache::put(cache::key(mmproj, a), (1, 3), &rows);
+    let ((nx, ny), back) = cache::get(cache::key(mmproj, a)).expect("cached image");
+    assert_eq!((nx, ny), (1, 3));
+    assert_eq!(back, rows);
+    assert!(cache::get(cache::key(mmproj, b)).is_none());
+    cache::clear();
+}

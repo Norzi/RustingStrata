@@ -143,6 +143,11 @@ placeholder position `p0`; `t = p0`, `x = p0 + i % nx`, `y = p0 + i / nx`, `z = 
   72); anything wider stays on the CPU. `STRATA_VISION_DEBUG=1` prints the time split: matmul count and seconds,
   broken into weight conversion, upload, GEMM and read-back, plus attention and the device-resident blocks.
   Weights and x are rounded to f16 inside the GEMM (f32 accumulation), the same as the model's own prefill.
+- `load_images` caches encoder results in host memory (`vision::cache`): the key is the projector's path and size
+  plus the image source (a data URL carries the whole image), and `STRATA_VISION_CACHE` sets how many images are kept
+  (default 4, 0 disables). A chat resends its history, images included, on every request, so the same image is
+  encoded once; attaching a new image encodes only the new one. `serve` accepts bodies up to 64 MiB, and the web page
+  downscales attachments to a 1280 px side (JPEG) before sending them, since the model sees at most a 30x40 grid.
 - `tests/gpu_model.rs::gpu_image_prefill_matches_cpu` checks the CPU prefill logits against the GPU on
   CUDA and Vulkan, the KV-row/RoPE-offset split, and that decoding names the image color. It runs on the
   default model (whose sibling `mmproj-F16.gguf` is found by `find_sibling`) or `STRATA_MODEL`.

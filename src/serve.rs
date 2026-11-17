@@ -16,7 +16,7 @@ pub struct Request {
 }
 
 /// Reads one request (Content-Length bodies only, no chunked uploads). Headers are capped at 64 KiB and the body at
-/// 8 MiB.
+/// 64 MiB: a chat resends its whole history on every request, images (base64 data URLs) included.
 pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
     let mut h = r.take(64 << 10);
     let mut line = String::new();
@@ -41,7 +41,7 @@ pub fn read_request(r: &mut impl BufRead) -> anyhow::Result<Request> {
             _ => {}
         }
     }
-    if len > 8 << 20 { bail!("body too large"); }
+    if len > 64 << 20 { bail!("body too large ({len} bytes; the limit is 64 MiB)"); }
     let mut body = vec![0; len];
     r.read_exact(&mut body)?;
     Ok(Request { method, path, host, auth, json, body })

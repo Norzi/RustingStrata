@@ -492,22 +492,37 @@ fn cpu_topology_groups(dir: &std::path::Path) -> usize {
     groups.len()
 }
 
-/// Decode and encode every `--image` with the projector at `mmproj`. `device` is the GPU the encoder runs on (None:
-/// the CPU), opened once for all the images of the request.
+/// Decode and encode every image with the projector at `mmproj`. `device` is the GPU the encoder runs on (None: the
+/// CPU). Results are cached by image source and projector (`vision::cache`): a chat resends its history, images
+/// included, on every request, so an image that was already encoded is not encoded again.
 fn load_images(mmproj: &Path, images: &[String], device: Option<usize>) -> anyhow::Result<ImageInput> {
-    let projector = VisionProjector::open(mmproj)?;
-    // Only the Qwen3-VL encoder has a GPU path; the Gemma projectors stay on the CPU.
-    let gpu = match projector.cfg().kind {
-        vision::ProjectorKind::Qwen3Vl => vision::gpu::VisionGpu::open(device),
-        _ => None,
-    };
+    let keys: Vec<u64> = images.iter().map(|s| vision::cache::key(mmproj, s)).collect();
     let mut grids = Vec::with_capacity(images.len());
     let mut embeddings = Vec::with_capacity(images.len());
-    for src in images {
+    // The projector and its GPU encoder are opened once, on the first image that misses the cache.
+    let mut enc: Option<(VisionProjector, Option<vision::gpu::VisionGpu>)> = None;
+    for (src, &key) in images.iter().zip(&keys) {
+        if let Some((grid, feats)) = vision::cache::get(key) {
+            eprintln!("image: {}x{} tokens (cached)", grid.0, grid.1);
+            grids.push(grid);
+            embeddings.push(feats);
+            continue;
+        }
+        if enc.is_none() {
+            let pr = VisionProjector::open(mmproj)?;
+            // Only the Qwen3-VL encoder has a GPU path; the Gemma projectors stay on the CPU.
+            let g = match pr.cfg().kind {
+                vision::ProjectorKind::Qwen3Vl => vision::gpu::VisionGpu::open(device),
+                _ => None,
+            };
+            enc = Some((pr, g));
+        }
+        let (p, gpu) = { let e = enc.as_ref().unwrap(); (&e.0, e.1.as_ref()) };
         let img = vision::load_image(src)?;
         let t0 = Instant::now();
-        let (feats, nx, ny) = vision::gpu::encode_image(&projector, &img, gpu.as_ref())?;
+        let (feats, nx, ny) = vision::gpu::encode_image(p, &img, gpu)?;
         eprintln!("image: {nx}x{ny} tokens encoded in {:.1} s", t0.elapsed().as_secs_f64());
+        vision::cache::put(key, (nx, ny), &feats);
         grids.push((nx, ny));
         embeddings.push(feats);
     }

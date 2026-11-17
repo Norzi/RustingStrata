@@ -170,7 +170,8 @@ fn rejects_bad_hosts_and_huge_headers() {
     assert_eq!(bad("").as_deref(), Some("empty request"));
     assert_eq!(bad("GET\r\n\r\n").as_deref(), Some("no path"));
     assert_eq!(bad("GET / HTTP/1.1\r\nHost: x\r\n").as_deref(), Some("headers cut off or too long"));
-    assert_eq!(bad("POST / HTTP/1.1\r\nContent-Length: 9000000\r\n\r\n").as_deref(), Some("body too large"));
+    assert_eq!(bad("POST / HTTP/1.1\r\nContent-Length: 70000000\r\n\r\n").as_deref(),
+               Some("body too large (70000000 bytes; the limit is 64 MiB)"));
     assert_eq!(bad("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n").as_deref(), Some("bad Content-Length"));
     assert!(bad("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab").is_some());
     assert!(bad("POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nab").is_none());
