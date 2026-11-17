@@ -17,11 +17,12 @@ const QTYPES: [GgmlType; 24] = {
     use GgmlType::*;
     [F32, BF16, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, Q4_1, Q5_1, Q4_0, Q5_0]
 };
-const KERNELS: [&str; 37] = [
+const KERNELS: [&str; 41] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "attn_vision",
+    "ln_rows", "bias_rows", "gelu_rows", "rope_vis_rows",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -852,15 +853,45 @@ impl Backend for Gpu {
         self.gemm_raw(w.ty, w.rows, w.cols, 0, n.div_ceil(GEMM_BM), w.ptr, n, x, x_stride, n, 0, y, y_stride, act)
     }
 
-    /// `attn_vision` in kernels.cu: everything up to 96 floats a head (three groups of 32 per lane).
-    fn vision_attn(&self, q: u64, k: u64, v: u64, y: u64, n: usize, nh: usize, hd: usize, scale: f32) -> anyhow::Result<bool> {
-        if n == 0 || nh == 0 || hd == 0 || hd > 96 { return Ok(false); }
+    /// `attn_vision` in kernels.cu: everything up to 96 floats a head (three groups of 32 per lane). `stride` is the
+    /// token stride of q, k and v in floats.
+    fn vision_attn(&self, q: u64, k: u64, v: u64, y: u64, n: usize, nh: usize, hd: usize, scale: f32, stride: usize) -> anyhow::Result<bool> {
+        if n == 0 || nh == 0 || hd == 0 || hd > 96 || stride < nh * hd { return Ok(false); }
         // `launch!` binds every argument to a local named `v`, so pass these under names that cannot shadow the
         // kernel's own `v`.
         let (qp, kp, vp, yp) = (q, k, v, y);
         // 8 warps a block, 4 tokens a warp (VQ in kernels.cu).
-        launch!(self, "attn_vision", cfg((nh as u32, n.div_ceil(32) as u32), 256, 0), qp, kp, vp, yp, n as i32, nh as i32, hd as i32, scale);
+        launch!(self, "attn_vision", cfg((nh as u32, n.div_ceil(32) as u32), 256, 0), qp, kp, vp, yp, n as i32, nh as i32, hd as i32, scale, stride as i32);
         Ok(true)
+    }
+
+    fn ln_rows(&self, x: u64, w: u64, b: u64, y: u64, n: usize, rows: usize, stride: usize, eps: f32) -> anyhow::Result<()> {
+        if n == 0 || rows == 0 { return Ok(()); }
+        // `launch!` names its own locals `b` and `v`: the arguments must not be spelled either way.
+        let (xp, wp, bp, yp) = (x, w, b, y);
+        launch!(self, "ln_rows", cfg((rows as u32, 1), 256, 0), xp, wp, bp, yp, n as i32, rows as i32, stride as i32, eps);
+        Ok(())
+    }
+
+    fn bias_rows(&self, y: u64, b: u64, n: usize, rows: usize, stride: usize) -> anyhow::Result<()> {
+        if n == 0 || rows == 0 { return Ok(()); }
+        let (yp, bp) = (y, b);
+        launch!(self, "bias_rows", cfg((rows as u32, 1), 256, 0), yp, bp, n as i32, rows as i32, stride as i32);
+        Ok(())
+    }
+
+    fn gelu_rows(&self, y: u64, b: u64, n: usize, rows: usize, stride: usize, mode: i32) -> anyhow::Result<()> {
+        if n == 0 || rows == 0 { return Ok(()); }
+        let (yp, bp) = (y, b);
+        launch!(self, "gelu_rows", cfg((rows as u32, 1), 256, 0), yp, bp, n as i32, rows as i32, stride as i32, mode);
+        Ok(())
+    }
+
+    fn rope_vis_rows(&self, x: u64, cs: u64, off: usize, nh: usize, hd: usize, rows: usize, stride: usize) -> anyhow::Result<()> {
+        if nh == 0 || hd < 2 || !hd.is_multiple_of(2) || rows == 0 { return Ok(()); }
+        let threads = rows * nh * (hd / 2);
+        launch!(self, "rope_vis_rows", Self::grid(threads), x, cs, off as i32, nh as i32, hd as i32, rows as i32, stride as i32);
+        Ok(())
     }
 
     fn int8_gemm(&self, ty: GgmlType) -> bool { self.int8_mma && Self::mmq(ty) }
@@ -1321,12 +1352,12 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 306 names today (sm_80); 22 non-float types x 2 fewer names = 262 on sm_70.
+    /// them out. 310 names today (sm_80); 22 non-float types x 2 fewer names = 266 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 306);
-        assert_eq!(sm70.len(), 262);
+        assert_eq!(sm80.len(), 310);
+        assert_eq!(sm70.len(), 266);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmis")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

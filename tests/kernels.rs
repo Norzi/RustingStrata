@@ -2047,7 +2047,7 @@ fn vision_attention_matches_reference() {
         let (dq, dk, dv) = (up(g, &q), up(g, &k), up(g, &v));
         let dy = g.zeros::<f32>(len).unwrap();
         let scale = 1.0 / (hd as f32).sqrt();
-        if !g.vision_attn(dq.addr(), dk.addr(), dv.addr(), dy.addr(), n, nh, hd, scale).unwrap() {
+        if !g.vision_attn(dq.addr(), dk.addr(), dv.addr(), dy.addr(), n, nh, hd, scale, nh * hd).unwrap() {
             eprintln!("SKIP: {bk} has no vision attention kernel");
             continue;
         }
@@ -2082,7 +2082,104 @@ fn vision_attention_rejects_wide_heads() {
         let g = &*gpu;
         let (dq, dk, dv) = (up(g, &x), up(g, &x), up(g, &x));
         let dy = g.zeros::<f32>(x.len()).unwrap();
-        let wide = g.vision_attn(dq.addr(), dk.addr(), dv.addr(), dy.addr(), n, nh, hd, 0.5).unwrap();
+        let wide = g.vision_attn(dq.addr(), dk.addr(), dv.addr(), dy.addr(), n, nh, hd, 0.5, nh * hd).unwrap();
         assert!(!wide, "{bk} must not claim head_dim {hd}");
+    }
+}
+
+/// Abramowitz-Stegun 7.1.26, as `projector::erf` uses it.
+fn erf_ref(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let y = 1.0 - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_741) * t - 0.284_496_736) * t + 0.254_829_592) * t * (-x * x).exp();
+    if x >= 0.0 { y } else { -y }
+}
+
+/// The ViT block glue kernels (LayerNorm, bias, activation) against `ops`, on rows that are `stride` floats apart:
+/// the encoder's QKV rows are three times wider than one of q, k or v.
+#[test]
+fn vision_block_rows_match_ops() {
+    use rusting_strata::ops;
+    let (rows, n, stride) = (7usize, 96usize, 3 * 96usize);
+    let eps = 1e-5f32;
+    let (x, w, b) = (xs(rows * stride), xs(n), xs(n));
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        eprintln!("backend {bk}");
+        let (dx, dw, db) = (up(g, &x), up(g, &w), up(g, &b));
+        let dy = g.zeros::<f32>(rows * stride).unwrap();
+        if g.ln_rows(dx.addr(), dw.addr(), db.addr(), dy.addr(), n, rows, stride, eps).is_err() {
+            eprintln!("SKIP: {bk} has no vision block kernels");
+            continue;
+        }
+        let got = down::<f32>(g, &dy);
+        for r in 0..rows {
+            let mut want = vec![0f32; n];
+            ops::layer_norm(&x[r * stride..r * stride + n], &w, &b, eps, &mut want);
+            let err = rel_l2(&got[r * stride..r * stride + n], &want);
+            assert!(err <= 1e-5, "{bk} ln_rows row {r}: rel err {err}");
+        }
+
+        // bias_rows leaves the padding columns alone; gelu_rows reads the bias it adds.
+        let mut buf = x.clone();
+        for r in 0..rows { for i in 0..n { buf[r * stride + i] += b[i]; } }
+        let dx = up(g, &x);
+        g.bias_rows(dx.addr(), db.addr(), n, rows, stride).unwrap();
+        let got = down::<f32>(g, &dx);
+        let err = rel_l2(&got, &buf);
+        assert!(err <= 1e-6, "{bk} bias_rows: rel err {err}");
+
+        let gelus: [(i32, fn(f32) -> f32); 4] =
+            [(0, ops::gelu), (1, |v: f32| 0.5 * v * (1.0 + erf_ref(v / std::f32::consts::SQRT_2))),
+             (2, ops::gelu_quick), (3, ops::silu)];
+        for (mode, f) in gelus {
+            let dx = up(g, &x);
+            g.gelu_rows(dx.addr(), db.addr(), n, rows, stride, mode).unwrap();
+            let got = down::<f32>(g, &dx);
+            for r in 0..rows {
+                for i in 0..n {
+                    let want = f(x[r * stride + i] + b[i]);
+                    let d = (got[r * stride + i] - want).abs();
+                    assert!(d <= 2e-5 * want.abs().max(1.0), "{bk} gelu_rows mode {mode} at {r},{i}: {d}");
+                }
+            }
+        }
+    }
+}
+
+/// The M-RoPE kernel against `ops::rope_vision`, with the cos/sin table the encoder builds (first half of the pairs
+/// turn by y, second by x, the theta exponent restarting at each section).
+#[test]
+fn vision_rope_rows_match_ops() {
+    use rusting_strata::ops;
+    let (rows, nh, hd, stride) = (6usize, 2usize, 8usize, 3 * 16usize);
+    let (base, half, section) = (10000f32, hd / 2, hd / 4);
+    let (x, mut cs) = (xs(rows * stride), vec![0f32; 2 * rows * half]);
+    let theta_scale = base.powf(-2.0 / half as f32);
+    let pos = |t: usize| ((t / 3 % 2) as i32, (t % 3) as i32);  // (py, px)
+    for t in 0..rows {
+        let (py, px) = pos(t);
+        for i in 0..half {
+            let (p, local) = if i < section { (py, i) } else { (px, i - section) };
+            let theta = p as f32 * theta_scale.powi(local as i32);
+            cs[t * half + i] = theta.cos();
+            cs[rows * half + t * half + i] = theta.sin();
+        }
+    }
+    let mut want = x.clone();
+    for t in 0..rows {
+        let (py, px) = pos(t);
+        for h in 0..nh { ops::rope_vision(&mut want[t * stride + h * hd..][..hd], py, px, base); }
+    }
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        let (dx, dc) = (up(g, &x), up(g, &cs));
+        if g.rope_vis_rows(dx.addr(), dc.addr(), 0, nh, hd, rows, stride).is_err() {
+            eprintln!("SKIP: {bk} has no vision M-RoPE kernel");
+            continue;
+        }
+        let got = down::<f32>(g, &dx);
+        let err = rel_l2(&got, &want);
+        eprintln!("vision_rope_rows {bk}: rel err {err:.2e}");
+        assert!(err <= 1e-6, "{bk} rope_vis_rows: rel err {err}");
     }
 }

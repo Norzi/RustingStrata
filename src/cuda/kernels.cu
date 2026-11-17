@@ -2916,9 +2916,11 @@ __device__ int block_scan(int v, int* tot) {
 // dimensions l, l + 32 and l + 64 of each of them. Online softmax (running max and sum, the same values in every lane).
 // grid = (nh, ceil(n / (8 * VQ))), block = 256.
 constexpr int VQ = 4;
+// `stride`: floats between consecutive tokens of q, k and v, so the packed QKV rows (3 * nh * hd) can be read
+// in place; y rows are always nh * hd apart.
 extern "C" __global__ void attn_vision(const float* __restrict__ q, const float* __restrict__ k,
                                        const float* __restrict__ v, float* __restrict__ y,
-                                       int n, int nh, int hd, float scale) {
+                                       int n, int nh, int hd, float scale, int stride) {
     int lane = threadIdx.x & 31, h = blockIdx.x;
     int t0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * VQ;
     if (t0 >= n) return;  // past the last token: nothing to load, and no barrier follows
@@ -2930,14 +2932,14 @@ extern "C" __global__ void attn_vision(const float* __restrict__ q, const float*
     for (int r = 0; r < VQ; r++) {
         on[r] = t0 + r < n;
         mx[r] = -1e30f; sum[r] = 0.0f;
-        const float* p = q + ((size_t)(t0 + r) * nh + h) * hd;
+        const float* p = q + (size_t)(t0 + r) * stride + (size_t)h * hd;
         q0[r] = on[r] && h0 ? p[d0] : 0.0f;
         q1[r] = on[r] && h1 ? p[d1] : 0.0f;
         q2[r] = on[r] && h2 ? p[d2] : 0.0f;
         o0[r] = o1[r] = o2[r] = 0.0f;
     }
     for (int j = 0; j < n; j++) {
-        const float* kp = k + ((size_t)j * nh + h) * hd;
+        const float* kp = k + (size_t)j * stride + (size_t)h * hd;
         float k0 = h0 ? kp[d0] : 0.0f, k1 = h1 ? kp[d1] : 0.0f, k2 = h2 ? kp[d2] : 0.0f;
         float w[VQ];
         #pragma unroll
@@ -2954,7 +2956,7 @@ extern "C" __global__ void attn_vision(const float* __restrict__ q, const float*
                 sum[r] += w[r];
             }
         }
-        const float* vp = v + ((size_t)j * nh + h) * hd;
+        const float* vp = v + (size_t)j * stride + (size_t)h * hd;
         float v0 = h0 ? vp[d0] : 0.0f, v1 = h1 ? vp[d1] : 0.0f, v2 = h2 ? vp[d2] : 0.0f;
         #pragma unroll
         for (int r = 0; r < VQ; r++) { o0[r] += w[r] * v0; o1[r] += w[r] * v1; o2[r] += w[r] * v2; }
@@ -2967,6 +2969,78 @@ extern "C" __global__ void attn_vision(const float* __restrict__ q, const float*
         if (h1) p[d1] = o1[r] / sum[r];
         if (h2) p[d2] = o2[r] / sum[r];
     }
+}
+
+// ---- vision encoder blocks: the CPU glue of the ViT (LayerNorm, bias, activation, M-RoPE) on the device, so the
+// 27 layers stay off the host. All of them take rows of `n` floats `stride` floats apart. ----
+
+// LayerNorm (mean and variance over the row, then the affine weight and bias), one block a row. y may not
+// overlap x.
+extern "C" __global__ void ln_rows(const float* __restrict__ x, const float* __restrict__ w,
+                                   const float* __restrict__ b, float* __restrict__ y,
+                                   int n, int rows, int stride, float eps) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    const int bd = blockDim.x;
+    const float* xr = x + (size_t)r * stride;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += bd) s += xr[i];
+    float mean = block_sum(s) / n, v = 0.0f;
+    for (int i = threadIdx.x; i < n; i += bd) { float d = xr[i] - mean; v += d * d; }
+    float inv = rsqrtf(block_sum(v) / n + eps);
+    float* yr = y + (size_t)r * stride;
+    for (int i = threadIdx.x; i < n; i += bd) yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+}
+
+// y[r * stride + i] += b[i].
+extern "C" __global__ void bias_rows(float* __restrict__ y, const float* __restrict__ b,
+                                     int n, int rows, int stride) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    const int bd = blockDim.x;
+    float* yr = y + (size_t)r * stride;
+    for (int i = threadIdx.x; i < n; i += bd) yr[i] += b[i];
+}
+
+// y = act(y + b): 0 tanh GELU, 1 A&S-ERF GELU (projector::erf), 2 quick GELU, 3 SiLU (`ops::activate`).
+extern "C" __global__ void gelu_rows(float* __restrict__ y, const float* __restrict__ b,
+                                     int n, int rows, int stride, int mode) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    const int bd = blockDim.x;
+    float* yr = y + (size_t)r * stride;
+    for (int i = threadIdx.x; i < n; i += bd) {
+        float v = yr[i] + b[i];
+        if (mode == 0) v = 0.5f * v * (1.0f + tanhf(0.79788456f * v * (1.0f + 0.044715f * v * v)));
+        else if (mode == 1) {
+            float u = v * 0.70710678f;  // erf(v / sqrt(2)): the A&S form approximates erf itself
+            float t = 1.0f / (1.0f + 0.3275911f * fabsf(u));
+            float e = 1.0f - (((((1.0614054f * t - 1.4531521f) * t) + 1.421413741f) * t - 0.284496736f) * t
+                              + 0.254829592f) * t * __expf(-u * u);
+            v = 0.5f * v * (1.0f + (u >= 0.0f ? e : -e));
+        } else if (mode == 2) v = v / (1.0f + __expf(-1.702f * v));
+        else v = v / (1.0f + __expf(-v));
+        yr[i] = v;
+    }
+}
+
+// Vision M-RoPE (`ops::rope_vision`): token row r, head h, pair p rotates x[p] with x[p + hd/2]. `cs` holds the
+// cos table (rows * hd/2 values) then the sin table; both were precomputed on the host with the token's (y, x)
+// position, so the device only multiplies.
+extern "C" __global__ void rope_vis_rows(float* __restrict__ x, const float* __restrict__ cs,
+                                         int off, int nh, int hd, int rows, int stride) {
+    int half = hd >> 1;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * nh * half) return;
+    int p = (int)(i % half);
+    size_t q = i / half;
+    int h = (int)(q % nh), r = (int)(q / nh);
+    float c = cs[(size_t)r * half + p];
+    float s = cs[(size_t)rows * half + (size_t)r * half + p];
+    float* e = x + (size_t)r * stride + off + (size_t)h * hd;
+    float a = e[p], b = e[p + half];
+    e[p] = a * c - b * s;
+    e[p + half] = a * s + b * c;
 }
 
 // grid = rows, block = 1024: the top `top` blocks of row r by score (ties to the lower block), in block order.

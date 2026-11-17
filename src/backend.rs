@@ -170,9 +170,29 @@ pub trait Backend: Send {
     /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
     /// Bidirectional (unmasked) vision-encoder attention over `n` tokens of `nh` heads of `hd` floats:
-    /// y[t][h][d] = softmax_j(scale * q[t][h]·k[j][h]) v[j][h]. `q`, `k`, `v` and `y` are [n][nh][hd] device floats.
+    /// y[t][h][d] = softmax_j(scale * q[t][h]·k[j][h]) v[j][h]. `q`, `k` and `v` are [n][nh][hd] device floats with a
+    /// token stride of `stride` floats, so a packed QKV matrix is read in place; `y` rows are nh*hd apart.
     /// False when this backend has no such kernel (the encoder then runs it on the CPU).
-    fn vision_attn(&self, _q: u64, _k: u64, _v: u64, _y: u64, _n: usize, _nh: usize, _hd: usize, _scale: f32) -> anyhow::Result<bool> { Ok(false) }
+    fn vision_attn(&self, _q: u64, _k: u64, _v: u64, _y: u64, _n: usize, _nh: usize, _hd: usize, _scale: f32, _stride: usize) -> anyhow::Result<bool> { Ok(false) }
+    /// LayerNorm over `rows` rows of `n` floats, `stride` floats apart: y = (x - mean) * rsqrt(var + eps) * w + b.
+    /// Together with `bias_rows`, `gelu_rows` and `rope_vis_rows` this is the CPU glue of the vision encoder's
+    /// transformer blocks, moved to the device so the blocks can run there without a round trip per layer.
+    fn ln_rows(&self, _x: u64, _w: u64, _b: u64, _y: u64, _n: usize, _rows: usize, _stride: usize, _eps: f32) -> anyhow::Result<()> {
+        anyhow::bail!("this backend has no vision layer-norm kernel")
+    }
+    /// y[r * stride + i] += b[i] for `rows` rows of `n`.
+    fn bias_rows(&self, _y: u64, _b: u64, _n: usize, _rows: usize, _stride: usize) -> anyhow::Result<()> {
+        anyhow::bail!("this backend has no vision bias kernel")
+    }
+    /// y = act(y + b) over `rows` rows of `n`: mode 0 tanh GELU, 1 A&S-ERF GELU, 2 quick GELU, 3 SiLU.
+    fn gelu_rows(&self, _y: u64, _b: u64, _n: usize, _rows: usize, _stride: usize, _mode: i32) -> anyhow::Result<()> {
+        anyhow::bail!("this backend has no vision activation kernel")
+    }
+    /// Vision M-RoPE on `rows` token rows of `nh` heads of `hd` floats at `off` in a row of `stride` floats, pairing
+    /// element p with p + hd/2. `cs` is the host-made cos table (rows * hd/2 values) followed by the sin table.
+    fn rope_vis_rows(&self, _x: u64, _cs: u64, _off: usize, _nh: usize, _hd: usize, _rows: usize, _stride: usize) -> anyhow::Result<()> {
+        anyhow::bail!("this backend has no vision M-RoPE kernel")
+    }
     fn prequant_gemm_x(&self, _w: &GpuTensor, _n: usize, _x: u64, _x_stride: usize) -> anyhow::Result<()> { Ok(()) }
     /// y = W x (all rows of `w`).
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()>;

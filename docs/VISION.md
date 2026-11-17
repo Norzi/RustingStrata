@@ -113,16 +113,24 @@ placeholder position `p0`; `t = p0`, `x = p0 + i % nx`, `y = p0 + i / nx`, `z = 
 - GPU vision encoder (`src/vision/gpu.rs`): under `--gpu` the Qwen3-VL encoder runs its matrix multiplies
   (patch convs, `attn_qkv`, `attn_out`, `ffn_up`, `ffn_down`, `mm.0`, `mm.2`) and the ViT's bidirectional
   attention on CUDA, with `STRATA_VISION_CPU=1` (or a non-CUDA backend, or under 512 MB of free VRAM) as the
-  CPU fallback. One weight matrix is resident at a time, so the ~0.9 GB of F16 weights never has to fit in
-  VRAM beside the text model; the GEMM K step is 64, so rows are zero-padded to it. Attention runs on
-  `attn_vision` (kernels.cu): one warp serves 4 patches of one head, so each key's K and V rows are read once
-  for 4 queries, with an online softmax and no mask. It supports `head_dim <= 96`, which covers the
-  Qwen3-VL ViT (16 heads x 72); anything wider stays on the CPU. The patch gather, LayerNorm, RoPE, the GELU
-  and the bias adds stay on the CPU, which is why the CPU is still busy during an encode. The device and host
-  buffers are reused across the 27 layers (`Scratch`), and attention writes into the caller's buffer, so the
-  only per-layer allocations are small. `STRATA_VISION_DEBUG=1` prints the time split: matmul count and
-  seconds, broken into weight conversion, upload, GEMM and read-back, plus attention. Weights and x are rounded
-  to f16 inside the GEMM (f32 accumulation), the same as the model's own prefill.
+  CPU fallback. The 27 ViT blocks normally run **entirely on the device** (`MatMul::blocks`): one upload of the
+  patch embeddings, then per layer `ln_rows` (LayerNorm with affine), the QKV GEMM, `bias_rows`,
+  `rope_vis_rows` (M-RoPE from a host-made cos/sin table), `attn_vision`, the output-projection GEMM accumulated
+  into the residual stream by the GEMM's own `act=2`, `ln_rows`, the up-projection GEMM (written into a buffer
+  whose rows are padded to the GEMM's 64-wide K step; the padding stays zero for the down-projection),
+  `gelu_rows` (bias + activation), and the down-projection GEMM into the residual stream. One read-back at the
+  end, so ~11 kernels a layer and no PCIe round trips. Weights go up as F32 (the GEMM types are `f32` and `bf16`),
+  each converted and zero-padded to the 64-wide K step as it is uploaded; that costs ~170 MB of VRAM, and a device
+  without room (or `STRATA_VISION_STREAM=1`) falls back to the streaming path: one weight matrix resident at a
+  time, each multiply uploaded as F32 with rows zero-padded to the K step, run, and dropped again, so the ~0.9 GB
+  of F16 weights never has to fit in VRAM
+  beside the text model.
+  Attention runs on `attn_vision` (kernels.cu): one warp serves 4 patches of one head, so each key's K and V rows
+  are read once for 4 queries, with an online softmax and no mask. It reads q/k/v with a token stride, so the
+  packed QKV rows are used in place, and supports `head_dim <= 96`, which covers the Qwen3-VL ViT (16 heads x
+  72); anything wider stays on the CPU. `STRATA_VISION_DEBUG=1` prints the time split: matmul count and seconds,
+  broken into weight conversion, upload, GEMM and read-back, plus attention and the device-resident blocks.
+  Weights and x are rounded to f16 inside the GEMM (f32 accumulation), the same as the model's own prefill.
 - `tests/gpu_model.rs::gpu_image_prefill_matches_cpu` checks the CPU prefill logits against the GPU on
   CUDA and Vulkan, the KV-row/RoPE-offset split, and that decoding names the image color. It runs on the
   default model (whose sibling `mmproj-F16.gguf` is found by `find_sibling`) or `STRATA_MODEL`.

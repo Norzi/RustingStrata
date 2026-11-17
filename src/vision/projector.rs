@@ -60,6 +60,24 @@ impl VisionProjector {
     }
 }
 
+/// The shape and settings of the ViT's transformer stack, everything `MatMul::blocks` needs to run all the layers on
+/// the device in one graph.
+pub(crate) struct BlockGeom {
+    /// Patch tokens.
+    pub n: usize,
+    pub n_embd: usize,
+    pub n_head: usize,
+    pub d_head: usize,
+    pub n_layer: usize,
+    pub eps: f32,
+    pub ffn: FfnKind,
+    /// RoPE theta base.
+    pub base: f32,
+    /// Spatial merge factor and patch blocks per row, for the M-RoPE positions.
+    pub m: usize,
+    pub mx: usize,
+}
+
 /// The matrix multiply the encoders run: on the CPU (`Tensor::matmul`), or on a GPU backend (`vision::gpu`).
 pub(crate) trait MatMul {
     /// `y[t * w.rows + r] = w[r] · x[t * w.cols..]` for `t < n`; with `add`, adds to `y` instead of replacing it.
@@ -67,6 +85,12 @@ pub(crate) trait MatMul {
     /// Bidirectional attention over all `n` tokens (`q`, `k`, `v` are [n][n_head*d_head]) written to `out`; false when
     /// the device has no kernel for this shape, so the caller runs it on the CPU.
     fn attn(&self, _q: &[f32], _k: &[f32], _v: &[f32], _n: usize, _n_head: usize, _d_head: usize, _scale: f32, _out: &mut [f32]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Run the whole `g.n_layer`-block ViT stack over `x` (`g.n * g.n_embd` values, in place) on the device, so the
+    /// 27 layers cost one upload and one read-back instead of a round trip per multiply. False when this backend
+    /// cannot (too little VRAM, a shape its kernels do not cover), and the caller streams the layers through `mm`.
+    fn blocks(&self, _p: &VisionProjector, _x: &mut [f32], _g: &BlockGeom) -> anyhow::Result<bool> {
         Ok(false)
     }
 }
@@ -180,8 +204,54 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
         x = layer_norm_all(&x, n_embd, &w, &b, c.eps);
     }
 
-    // 4. transformer blocks. Every buffer is reused across the layers: a fresh `vec![0f32; ...]` per layer
-    // would zero (and page in) ~250 MB 27 times.
+    // 4. transformer blocks. A backend that can hold the whole stack runs all 27 layers on the device in one graph
+    // (one upload, one read-back); otherwise each multiply streams through `mm` and the glue stays on the CPU.
+    let geom = BlockGeom {
+        n: n_patches, n_embd, n_head: c.n_head, d_head: c.d_head, n_layer: c.n_layer,
+        eps: c.eps, ffn: c.ffn, base: 10000.0, m, mx,
+    };
+    let mut on_device = false;
+    if let Some(m) = mm {
+        match m.blocks(p, &mut x, &geom) {
+            Ok(v) => on_device = v,
+            Err(e) => eprintln!("image: the GPU vision blocks failed ({e:#}); streaming them through the backend"),
+        }
+    }
+    if !on_device { encode_blocks(p, mm, &mut x, m, mx)?; }
+
+    // 5. post-layernorm.
+    let post_w = p.model.to_f32("v.post_ln.weight")?;
+    let post_b = p.model.to_f32("v.post_ln.bias")?;
+    let x = layer_norm_all(&x, n_embd, &post_w, &post_b, c.eps);
+
+    // 6. The patch sequence is already in 2x2 block order, so the merger just reinterprets four
+    // consecutive n_embd rows as one 4*n_embd token.
+    let feat = n_embd * m * m;
+    anyhow::ensure!(x.len() == n_merged * feat, "merge shape mismatch");
+
+    // 7. merger: mm.0 (4*n_embd -> 4*n_embd) + GELU + mm.2 (4*n_embd -> projection_dim).
+    let mm0 = p.model.tensor("mm.0.weight")?;
+    let mm0_b = p.model.tensor("mm.0.bias")?;
+    let mut proj = vec![0f32; n_merged * feat];
+    mmul(mm, &mm0, &x, n_merged, &mut proj, false)?;
+    add_bias_rows(&mut proj, &mm0_b, feat);
+    proj.par_iter_mut().for_each(|v| *v = activate(c.ffn, *v));
+    let mm2 = p.model.tensor("mm.2.weight")?;
+    let mm2_b = p.model.tensor("mm.2.bias")?;
+    let mut out = vec![0f32; n_merged * c.projection_dim];
+    mmul(mm, &mm2, &proj, n_merged, &mut out, false)?;
+    add_bias_rows(&mut out, &mm2_b, c.projection_dim);
+
+    rows(out, n_merged, c.projection_dim)
+}
+
+/// The per-layer streaming path of the Qwen3-VL ViT: every multiply goes through `mm` (the device or the CPU) and
+/// the LayerNorm, RoPE, residual adds and GELU stay on the host. Used when `MatMul::blocks` declines. Every buffer is
+/// reused across the 27 layers: a fresh `vec![0f32; ...]` per layer would zero (and page in) ~250 MB 27 times.
+fn encode_blocks(p: &VisionProjector, mm: Option<&dyn MatMul>, x: &mut [f32], m: usize, mx: usize) -> anyhow::Result<()> {
+    let c = &p.model.cfg;
+    let n_embd = c.n_embd;
+    let n_patches = x.len() / n_embd;
     let base = 10000.0f32;
     let scale = 1.0 / (c.d_head as f32).sqrt();
     let n3 = n_patches * n_embd;
@@ -200,7 +270,7 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
         let ln2w = p.model.to_f32(&format!("v.blk.{il}.ln2.weight"))?;
         let ln2b = p.model.to_f32(&format!("v.blk.{il}.ln2.bias"))?;
 
-        layer_norm_into(&x, n_embd, &ln1w, &ln1b, c.eps, &mut h);
+        layer_norm_into(x, n_embd, &ln1w, &ln1b, c.eps, &mut h);
         let qkv_w = p.model.tensor(&format!("v.blk.{il}.attn_qkv.weight"))?;
         let qkv_b = p.model.tensor(&format!("v.blk.{il}.attn_qkv.bias"))?;
         mmul(mm, &qkv_w, &h, n_patches, &mut qkv, false)?;
@@ -237,7 +307,7 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
         add_bias_rows(&mut attn_out, &wo_b, n_embd);
         x.par_iter_mut().zip(attn_out.par_iter()).for_each(|(a, b)| *a += *b);
 
-        layer_norm_into(&x, n_embd, &ln2w, &ln2b, c.eps, &mut h);
+        layer_norm_into(x, n_embd, &ln2w, &ln2b, c.eps, &mut h);
         let up_w = p.model.tensor(&format!("v.blk.{il}.ffn_up.weight"))?;
         let up_b = p.model.tensor(&format!("v.blk.{il}.ffn_up.bias"))?;
         up.resize(n_patches * up_w.rows, 0.0);
@@ -250,31 +320,7 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
         add_bias_rows(&mut down, &down_b, n_embd);
         x.par_iter_mut().zip(down.par_iter()).for_each(|(a, b)| *a += *b);
     }
-
-    // 5. post-layernorm.
-    let post_w = p.model.to_f32("v.post_ln.weight")?;
-    let post_b = p.model.to_f32("v.post_ln.bias")?;
-    let x = layer_norm_all(&x, n_embd, &post_w, &post_b, c.eps);
-
-    // 6. The patch sequence is already in 2x2 block order, so the merger just reinterprets four
-    // consecutive n_embd rows as one 4*n_embd token.
-    let feat = n_embd * m * m;
-    anyhow::ensure!(x.len() == n_merged * feat, "merge shape mismatch");
-
-    // 7. merger: mm.0 (4*n_embd -> 4*n_embd) + GELU + mm.2 (4*n_embd -> projection_dim).
-    let mm0 = p.model.tensor("mm.0.weight")?;
-    let mm0_b = p.model.tensor("mm.0.bias")?;
-    let mut proj = vec![0f32; n_merged * feat];
-    mmul(mm, &mm0, &x, n_merged, &mut proj, false)?;
-    add_bias_rows(&mut proj, &mm0_b, feat);
-    proj.par_iter_mut().for_each(|v| *v = activate(c.ffn, *v));
-    let mm2 = p.model.tensor("mm.2.weight")?;
-    let mm2_b = p.model.tensor("mm.2.bias")?;
-    let mut out = vec![0f32; n_merged * c.projection_dim];
-    mmul(mm, &mm2, &proj, n_merged, &mut out, false)?;
-    add_bias_rows(&mut out, &mm2_b, c.projection_dim);
-
-    rows(out, n_merged, c.projection_dim)
+    Ok(())
 }
 
 /// Gemma 4 vision tower: `2*x-1` patches, x/y learned position tables, RMS ViT with split NEOX RoPE,
