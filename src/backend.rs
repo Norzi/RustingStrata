@@ -389,4 +389,11 @@ impl<'a> dyn Backend + 'a {
         self.dtoh(src, at * size_of::<T>(), b)?;
         Ok(v)
     }
+
+    /// `get` into a caller buffer, so a repeated read-back (the vision encoder's per-layer results) does not
+    /// allocate and page in a fresh 20-80 MB vector every time.
+    pub fn get_into<T: Plain>(&self, src: &Buf, at: usize, dst: &mut [T]) -> anyhow::Result<()> {
+        let b = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), size_of_val(dst)) };
+        self.dtoh(src, at * size_of::<T>(), b)
+    }
 }

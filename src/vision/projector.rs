@@ -64,10 +64,10 @@ impl VisionProjector {
 pub(crate) trait MatMul {
     /// `y[t * w.rows + r] = w[r] · x[t * w.cols..]` for `t < n`; with `add`, adds to `y` instead of replacing it.
     fn mm(&self, w: &Tensor, x: &[f32], n: usize, y: &mut [f32], add: bool) -> anyhow::Result<()>;
-    /// Bidirectional attention over all `n` tokens (`q`, `k`, `v` are [n][n_head*d_head]); None when the device has
-    /// no kernel for this shape, so the caller runs it on the CPU.
-    fn attn(&self, _q: &[f32], _k: &[f32], _v: &[f32], _n: usize, _n_head: usize, _d_head: usize, _scale: f32) -> anyhow::Result<Option<Vec<f32>>> {
-        Ok(None)
+    /// Bidirectional attention over all `n` tokens (`q`, `k`, `v` are [n][n_head*d_head]) written to `out`; false when
+    /// the device has no kernel for this shape, so the caller runs it on the CPU.
+    fn attn(&self, _q: &[f32], _k: &[f32], _v: &[f32], _n: usize, _n_head: usize, _d_head: usize, _scale: f32, _out: &mut [f32]) -> anyhow::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -84,16 +84,17 @@ fn mmul(mm: Option<&dyn MatMul>, w: &Tensor, x: &[f32], n: usize, y: &mut [f32],
     Ok(())
 }
 
-/// The ViT's bidirectional attention on `mm` when the device has a kernel for it, else on the CPU.
-fn attn(mm: Option<&dyn MatMul>, q: &[f32], k: &[f32], v: &[f32], n: usize, n_head: usize, d_head: usize, scale: f32) -> Vec<f32> {
+/// The ViT's bidirectional attention on `mm` when the device has a kernel for it, else on the CPU. `out` is
+/// `n * n_head * d_head` values; reusing the caller's buffer keeps a 20-80 MB allocation out of every layer.
+fn attn(mm: Option<&dyn MatMul>, q: &[f32], k: &[f32], v: &[f32], n: usize, n_head: usize, d_head: usize, scale: f32, out: &mut [f32]) {
     if let Some(m) = mm {
-        match m.attn(q, k, v, n, n_head, d_head, scale) {
-            Ok(Some(o)) => return o,
-            Ok(None) => {}
+        match m.attn(q, k, v, n, n_head, d_head, scale, out) {
+            Ok(true) => return,
+            Ok(false) => {}
             Err(e) => eprintln!("image: the GPU vision attention failed ({e:#}); running it on the CPU"),
         }
     }
-    attention(q, k, v, n, n_head, d_head, scale)
+    attention_into(q, k, v, n, n_head, d_head, scale, out);
 }
 
 fn merge_shape(c: &ClipConfig, img: &PreprocessedImage) -> anyhow::Result<(usize, usize, usize, usize)> {
@@ -179,25 +180,32 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
         x = layer_norm_all(&x, n_embd, &w, &b, c.eps);
     }
 
-    // 4. transformer blocks.
+    // 4. transformer blocks. Every buffer is reused across the layers: a fresh `vec![0f32; ...]` per layer
+    // would zero (and page in) ~250 MB 27 times.
     let base = 10000.0f32;
     let scale = 1.0 / (c.d_head as f32).sqrt();
+    let n3 = n_patches * n_embd;
+    let mut h = vec![0f32; n3];
+    let mut qkv = vec![0f32; 3 * n3];
+    let mut q = vec![0f32; n3];
+    let mut k = vec![0f32; n3];
+    let mut v = vec![0f32; n3];
+    let mut heads = vec![0f32; n3];
+    let mut attn_out = vec![0f32; n3];
+    let mut up = Vec::new();
+    let mut down = vec![0f32; n3];
     for il in 0..c.n_layer {
         let ln1w = p.model.to_f32(&format!("v.blk.{il}.ln1.weight"))?;
         let ln1b = p.model.to_f32(&format!("v.blk.{il}.ln1.bias"))?;
         let ln2w = p.model.to_f32(&format!("v.blk.{il}.ln2.weight"))?;
         let ln2b = p.model.to_f32(&format!("v.blk.{il}.ln2.bias"))?;
 
-        let h = layer_norm_all(&x, n_embd, &ln1w, &ln1b, c.eps);
+        layer_norm_into(&x, n_embd, &ln1w, &ln1b, c.eps, &mut h);
         let qkv_w = p.model.tensor(&format!("v.blk.{il}.attn_qkv.weight"))?;
         let qkv_b = p.model.tensor(&format!("v.blk.{il}.attn_qkv.bias"))?;
-        let mut qkv = vec![0f32; n_patches * 3 * n_embd];
         mmul(mm, &qkv_w, &h, n_patches, &mut qkv, false)?;
         add_bias_rows(&mut qkv, &qkv_b, 3 * n_embd);
 
-        let mut q = vec![0f32; n_patches * n_embd];
-        let mut k = vec![0f32; n_patches * n_embd];
-        let mut v = vec![0f32; n_patches * n_embd];
         q.par_chunks_mut(n_embd).zip(k.par_chunks_mut(n_embd)).zip(v.par_chunks_mut(n_embd)).enumerate()
             .for_each(|(t, ((qs, ks), vs))| {
                 let row = &qkv[t * 3 * n_embd..(t + 1) * 3 * n_embd];
@@ -222,24 +230,22 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
             for h in row.chunks_exact_mut(c.d_head) { ops::rope_vision(h, py, px, base); }
         });
 
-        let heads = attn(mm, &q, &k, &v, n_patches, c.n_head, c.d_head, scale);
+        attn(mm, &q, &k, &v, n_patches, c.n_head, c.d_head, scale, &mut heads);
         let wo_w = p.model.tensor(&format!("v.blk.{il}.attn_out.weight"))?;
         let wo_b = p.model.tensor(&format!("v.blk.{il}.attn_out.bias"))?;
-        let mut attn_out = vec![0f32; n_patches * n_embd];
         mmul(mm, &wo_w, &heads, n_patches, &mut attn_out, false)?;
         add_bias_rows(&mut attn_out, &wo_b, n_embd);
         x.par_iter_mut().zip(attn_out.par_iter()).for_each(|(a, b)| *a += *b);
 
-        let h = layer_norm_all(&x, n_embd, &ln2w, &ln2b, c.eps);
+        layer_norm_into(&x, n_embd, &ln2w, &ln2b, c.eps, &mut h);
         let up_w = p.model.tensor(&format!("v.blk.{il}.ffn_up.weight"))?;
         let up_b = p.model.tensor(&format!("v.blk.{il}.ffn_up.bias"))?;
-        let mut up = vec![0f32; n_patches * c.n_ff];
+        up.resize(n_patches * up_w.rows, 0.0);
         mmul(mm, &up_w, &h, n_patches, &mut up, false)?;
-        add_bias_rows(&mut up, &up_b, c.n_ff);
+        add_bias_rows(&mut up, &up_b, up_w.rows);
         up.par_iter_mut().for_each(|v| *v = activate(c.ffn, *v));
         let down_w = p.model.tensor(&format!("v.blk.{il}.ffn_down.weight"))?;
         let down_b = p.model.tensor(&format!("v.blk.{il}.ffn_down.bias"))?;
-        let mut down = vec![0f32; n_patches * n_embd];
         mmul(mm, &down_w, &up, n_patches, &mut down, false)?;
         add_bias_rows(&mut down, &down_b, n_embd);
         x.par_iter_mut().zip(down.par_iter()).for_each(|(a, b)| *a += *b);
@@ -500,11 +506,16 @@ fn erf(x: f32) -> f32 {
 }
 
 fn layer_norm_all(x: &[f32], n_embd: usize, w: &[f32], b: &[f32], eps: f32) -> Vec<f32> {
-    x.par_chunks(n_embd).flat_map_iter(|row| {
-        let mut o = vec![0f32; n_embd];
-        ops::layer_norm(row, w, b, eps, &mut o);
-        o.into_iter()
-    }).collect()
+    let mut out = vec![0f32; x.len()];
+    layer_norm_into(x, n_embd, w, b, eps, &mut out);
+    out
+}
+
+/// `layer_norm_all` into a caller buffer (same length as `x`): one allocation less per transformer layer.
+fn layer_norm_into(x: &[f32], n_embd: usize, w: &[f32], b: &[f32], eps: f32, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), x.len());
+    out.par_chunks_mut(n_embd).zip(x.par_chunks(n_embd))
+        .for_each(|(o, row)| ops::layer_norm(row, w, b, eps, o));
 }
 
 fn rms_norm_all(x: &[f32], n_embd: usize, w: &[f32], eps: f32) -> Vec<f32> {
@@ -542,6 +553,13 @@ fn add_bias_rows(out: &mut [f32], bias: &Tensor, cols: usize) {
 
 fn attention(q: &[f32], k: &[f32], v: &[f32], n: usize, n_head: usize, d_head: usize, scale: f32) -> Vec<f32> {
     let mut out = vec![0f32; n * n_head * d_head];
+    attention_into(q, k, v, n, n_head, d_head, scale, &mut out);
+    out
+}
+
+/// `attention` into a caller buffer (`n * n_head * d_head` values).
+fn attention_into(q: &[f32], k: &[f32], v: &[f32], n: usize, n_head: usize, d_head: usize, scale: f32, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), n * n_head * d_head);
     out.par_chunks_mut(n_head * d_head).enumerate().for_each(|(t, o)| {
         let mut scores = vec![0f32; n];
         for h in 0..n_head {
@@ -559,7 +577,6 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], n: usize, n_head: usize, d_head: u
             }
         }
     });
-    out
 }
 
 /// Run the encoder for an image and return features plus the token grid (`nx, ny`).

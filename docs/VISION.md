@@ -118,9 +118,11 @@ placeholder position `p0`; `t = p0`, `x = p0 + i % nx`, `y = p0 + i / nx`, `z = 
   `attn_vision` (kernels.cu): one warp serves 4 patches of one head, so each key's K and V rows are read once
   for 4 queries, with an online softmax and no mask. It supports `head_dim <= 96`, which covers the
   Qwen3-VL ViT (16 heads x 72); anything wider stays on the CPU. The patch gather, LayerNorm, RoPE, the GELU
-  and the bias adds stay on the CPU, which is why the CPU is still busy during an encode. `STRATA_VISION_DEBUG=1`
-  also prints the device time split into matmuls and attention. Weights and x are rounded to f16 inside the
-  GEMM (f32 accumulation), the same as the model's own prefill.
+  and the bias adds stay on the CPU, which is why the CPU is still busy during an encode. The device and host
+  buffers are reused across the 27 layers (`Scratch`), and attention writes into the caller's buffer, so the
+  only per-layer allocations are small. `STRATA_VISION_DEBUG=1` prints the time split: matmul count and
+  seconds, broken into weight conversion, upload, GEMM and read-back, plus attention. Weights and x are rounded
+  to f16 inside the GEMM (f32 accumulation), the same as the model's own prefill.
 - `tests/gpu_model.rs::gpu_image_prefill_matches_cpu` checks the CPU prefill logits against the GPU on
   CUDA and Vulkan, the KV-row/RoPE-offset split, and that decoding names the image color. It runs on the
   default model (whose sibling `mmproj-F16.gguf` is found by `find_sibling`) or `STRATA_MODEL`.
