@@ -415,6 +415,8 @@ impl Engine {
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
+    /// The GPU the vision encoder runs on: the first selected device under `--gpu`, else the CPU (None).
+    fn vision_device(&self) -> Option<usize> { self.gpu.then(|| self.device.first().copied().unwrap_or(0)) }
 }
 
 /// Per-device VRAM margins in MB from `--vram-margin`: one value for every device, one per device like `512,256`,
@@ -490,15 +492,21 @@ fn cpu_topology_groups(dir: &std::path::Path) -> usize {
     groups.len()
 }
 
-/// Decode and encode every `--image` with the projector at `mmproj`.
-fn load_images(mmproj: &Path, images: &[String]) -> anyhow::Result<ImageInput> {
+/// Decode and encode every `--image` with the projector at `mmproj`. `device` is the GPU the encoder runs on (None:
+/// the CPU), opened once for all the images of the request.
+fn load_images(mmproj: &Path, images: &[String], device: Option<usize>) -> anyhow::Result<ImageInput> {
     let projector = VisionProjector::open(mmproj)?;
+    // Only the Qwen3-VL encoder has a GPU path; the Gemma projectors stay on the CPU.
+    let gpu = match projector.cfg().kind {
+        vision::ProjectorKind::Qwen3Vl => vision::gpu::VisionGpu::open(device),
+        _ => None,
+    };
     let mut grids = Vec::with_capacity(images.len());
     let mut embeddings = Vec::with_capacity(images.len());
     for src in images {
         let img = vision::load_image(src)?;
         let t0 = Instant::now();
-        let (feats, nx, ny) = vision::encode_image(&projector, &img)?;
+        let (feats, nx, ny) = vision::gpu::encode_image(&projector, &img, gpu.as_ref())?;
         eprintln!("image: {nx}x{ny} tokens encoded in {:.1} s", t0.elapsed().as_secs_f64());
         grids.push((nx, ny));
         embeddings.push(feats);
@@ -952,7 +960,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if image.is_empty() { return rusting_strata::gemma4::generate(&g, &prompt, n); }
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
-                let input = load_images(mmproj, &image)?;
+                let input = load_images(mmproj, &image, engine.vision_device())?;
                 return rusting_strata::gemma4::generate_image(&g, &prompt, &input.grids, &input.embeddings, n);
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("glm5-next") {
@@ -978,7 +986,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             } else {
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
-                let input = load_images(mmproj, &image)?;
+                let input = load_images(mmproj, &image, engine.vision_device())?;
                 Some((build_image_prompt(&tok, &input, &image, &prompt)?, input))
             };
             let ids = tok.encode(&prompt)?;
@@ -1151,7 +1159,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let input = if image.is_empty() { None } else {
                     let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
                     let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
-                    Some(load_images(mmproj, &image)?)
+                    Some(load_images(mmproj, &image, engine.vision_device())?)
                 };
                 return match &input {
                     Some(i) => rusting_strata::gemma4::chat(&g, system, n, think, Some((&i.grids, &i.embeddings))),
@@ -1172,7 +1180,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let image_input = if image.is_empty() { None } else {
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
-                Some(load_images(mmproj, &image)?)
+                Some(load_images(mmproj, &image, engine.vision_device())?)
             };
             let mut r = engine.runner(&m, &model)?;
             let mut smp = engine.sampler();
@@ -2248,7 +2256,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     let n = if images.is_empty() { l.tok.encode(&prompt)?.len() } else {
                         let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
                         let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
-                        let input = load_images(mmproj, &images)?;
+                        let input = load_images(mmproj, &images, e.vision_device())?;
                         build_image_prompt(l.tok, &input, &images, &prompt)?.ids.len()
                     };
                     send(&mut w, "200 OK", json!({"input_tokens": n}))
@@ -2279,7 +2287,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let image_input = if images.is_empty() { None } else {
                 let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
                 let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
-                Some(load_images(mmproj, &images)?)
+                Some(load_images(mmproj, &images, e.vision_device())?)
             };
             let vision_prompt = match &image_input {
                 Some(input) => Some(build_image_prompt(tok, input, &images, &prompt)?),

@@ -45,13 +45,38 @@ impl VisionProjector {
 
     /// Run the encoder. Returns `nx * ny` rows of `projection_dim` features in row-major token order.
     pub fn encode(&self, img: &PreprocessedImage) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.encode_with(img, None)
+    }
+
+    /// `encode`, with `mm` running the encoder's matrix multiplies (None: the CPU). Only the Qwen3-VL encoder has
+    /// a GPU path; the others always run on the CPU.
+    pub(crate) fn encode_with(&self, img: &PreprocessedImage, mm: Option<&dyn MatMul>) -> anyhow::Result<Vec<Vec<f32>>> {
         match self.model.cfg.kind {
-            ProjectorKind::Qwen3Vl => encode_qwen3vl(self, img),
+            ProjectorKind::Qwen3Vl => encode_qwen3vl(self, img, mm),
             ProjectorKind::Gemma4V => encode_gemma4v(self, img),
             ProjectorKind::Gemma4Uv => encode_gemma4uv(self, img),
             ProjectorKind::Glm4V => bail!("GLM-4V projectors are not implemented yet"),
         }
     }
+}
+
+/// The matrix multiply the encoders run: on the CPU (`Tensor::matmul`), or on a GPU backend (`vision::gpu`).
+pub(crate) trait MatMul {
+    /// `y[t * w.rows + r] = w[r] · x[t * w.cols..]` for `t < n`; with `add`, adds to `y` instead of replacing it.
+    fn mm(&self, w: &Tensor, x: &[f32], n: usize, y: &mut [f32], add: bool) -> anyhow::Result<()>;
+}
+
+/// `w.matmul(x, n, y)` on `mm`, or on the CPU when `mm` is None.
+fn mmul(mm: Option<&dyn MatMul>, w: &Tensor, x: &[f32], n: usize, y: &mut [f32], add: bool) -> anyhow::Result<()> {
+    if let Some(m) = mm { return m.mm(w, x, n, y, add); }
+    if add {
+        let mut t = vec![0f32; y.len()];
+        w.matmul(x, n, &mut t);
+        for (a, b) in y.iter_mut().zip(&t) { *a += *b; }
+    } else {
+        w.matmul(x, n, y);
+    }
+    Ok(())
 }
 
 fn merge_shape(c: &ClipConfig, img: &PreprocessedImage) -> anyhow::Result<(usize, usize, usize, usize)> {
@@ -67,7 +92,7 @@ fn merge_shape(c: &ClipConfig, img: &PreprocessedImage) -> anyhow::Result<(usize
 
 /// Qwen3-VL: two summed patch convs, resized learned position embedding, 2x2 patch reorder before the ViT,
 /// then the `mm.0`/`mm.2` merger.
-fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Result<Vec<Vec<f32>>> {
+fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn MatMul>) -> anyhow::Result<Vec<Vec<f32>>> {
     let c = &p.model.cfg;
     anyhow::ensure!(c.n_merge > 0, "clip: spatial_merge_size is 0");
     let m = c.n_merge;
@@ -77,17 +102,17 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
     let n_embd = c.n_embd;
     let patch_area = c.patch_size * c.patch_size * 3;
 
-    // 1. patch convolution. `v.patch_embd.weight` is [kx, ky, c, out]; flatten it to [out][kx,ky,c].
+    // 1. patch convolution over one [n_patches, patch_area] matrix of image patches.
+    // `v.patch_embd.weight` is [kx, ky, c, out]; flatten it to [out][kx,ky,c].
     let w0 = p.model.tensor_as("v.patch_embd.weight", Some(patch_area))?;
     let w1 = p.model.tensor_as("v.patch_embd.weight.1", Some(patch_area))?;
     let bias = p.model.tensor("v.patch_embd.bias")?;
     let mut patch_bias = vec![0f32; n_embd];
     bias.row(0, &mut patch_bias);
-    let mut x = vec![0f32; n_patches * n_embd];
-    x.par_chunks_mut(n_embd).enumerate().for_each(|(q, xs)| {
+    let mut patches = vec![0f32; n_patches * patch_area];
+    patches.par_chunks_mut(patch_area).enumerate().for_each(|(q, patch)| {
         let px = q % n_patches_x;
         let py = q / n_patches_x;
-        let mut patch = vec![0f32; patch_area];
         for ky in 0..c.patch_size {
             for kx in 0..c.patch_size {
                 for ch in 0..3 {
@@ -96,15 +121,11 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
                 }
             }
         }
-        let mut buf = vec![0f32; patch_area];
-        for o in 0..n_embd {
-            w0.row(o, &mut buf);
-            let mut v = buf.iter().zip(&patch).map(|(a, b)| a * b).sum::<f32>();
-            w1.row(o, &mut buf);
-            v += buf.iter().zip(&patch).map(|(a, b)| a * b).sum::<f32>();
-            xs[o] = v + patch_bias[o];
-        }
     });
+    let mut x = vec![0f32; n_patches * n_embd];
+    mmul(mm, &w0, &patches, n_patches, &mut x, false)?;
+    mmul(mm, &w1, &patches, n_patches, &mut x, true)?;
+    x.par_chunks_mut(n_embd).for_each(|xs| for (o, v) in xs.iter_mut().enumerate() { *v += patch_bias[o]; });
 
     // 2. learned 2-D position embedding, resized from 48x48 to the actual patch grid.
     let pos = p.model.to_f32("v.position_embd.weight")?;
@@ -154,7 +175,7 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let qkv_w = p.model.tensor(&format!("v.blk.{il}.attn_qkv.weight"))?;
         let qkv_b = p.model.tensor(&format!("v.blk.{il}.attn_qkv.bias"))?;
         let mut qkv = vec![0f32; n_patches * 3 * n_embd];
-        qkv_w.matmul(&h, n_patches, &mut qkv);
+        mmul(mm, &qkv_w, &h, n_patches, &mut qkv, false)?;
         add_bias_rows(&mut qkv, &qkv_b, 3 * n_embd);
 
         let mut q = vec![0f32; n_patches * n_embd];
@@ -187,7 +208,7 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let wo_w = p.model.tensor(&format!("v.blk.{il}.attn_out.weight"))?;
         let wo_b = p.model.tensor(&format!("v.blk.{il}.attn_out.bias"))?;
         let mut attn_out = vec![0f32; n_patches * n_embd];
-        wo_w.matmul(&attn, n_patches, &mut attn_out);
+        mmul(mm, &wo_w, &attn, n_patches, &mut attn_out, false)?;
         add_bias_rows(&mut attn_out, &wo_b, n_embd);
         for (a, b) in x.iter_mut().zip(&attn_out) { *a += *b; }
 
@@ -195,13 +216,13 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
         let up_w = p.model.tensor(&format!("v.blk.{il}.ffn_up.weight"))?;
         let up_b = p.model.tensor(&format!("v.blk.{il}.ffn_up.bias"))?;
         let mut up = vec![0f32; n_patches * c.n_ff];
-        up_w.matmul(&h, n_patches, &mut up);
+        mmul(mm, &up_w, &h, n_patches, &mut up, false)?;
         add_bias_rows(&mut up, &up_b, c.n_ff);
         up.par_iter_mut().for_each(|v| *v = activate(c.ffn, *v));
         let down_w = p.model.tensor(&format!("v.blk.{il}.ffn_down.weight"))?;
         let down_b = p.model.tensor(&format!("v.blk.{il}.ffn_down.bias"))?;
         let mut down = vec![0f32; n_patches * n_embd];
-        down_w.matmul(&up, n_patches, &mut down);
+        mmul(mm, &down_w, &up, n_patches, &mut down, false)?;
         add_bias_rows(&mut down, &down_b, n_embd);
         for (a, b) in x.iter_mut().zip(&down) { *a += *b; }
     }
@@ -220,13 +241,13 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage) -> anyhow::Resul
     let mm0 = p.model.tensor("mm.0.weight")?;
     let mm0_b = p.model.tensor("mm.0.bias")?;
     let mut proj = vec![0f32; n_merged * feat];
-    mm0.matmul(&x, n_merged, &mut proj);
+    mmul(mm, &mm0, &x, n_merged, &mut proj, false)?;
     add_bias_rows(&mut proj, &mm0_b, feat);
     proj.par_iter_mut().for_each(|v| *v = activate(c.ffn, *v));
     let mm2 = p.model.tensor("mm.2.weight")?;
     let mm2_b = p.model.tensor("mm.2.bias")?;
     let mut out = vec![0f32; n_merged * c.projection_dim];
-    mm2.matmul(&proj, n_merged, &mut out);
+    mmul(mm, &mm2, &proj, n_merged, &mut out, false)?;
     add_bias_rows(&mut out, &mm2_b, c.projection_dim);
 
     rows(out, n_merged, c.projection_dim)

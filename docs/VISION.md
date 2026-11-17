@@ -37,6 +37,7 @@ src/vision/mod.rs        VisionSpec, mmproj discovery/validation, registry
 src/vision/mmproj.rs     CLIP GGUF metadata + tensor access
 src/vision/image.rs      decode, data URL/HTTP fetch, smart resize, normalize
 src/vision/projector.rs  VisionProjector struct + Qwen3VL encoder
+src/vision/gpu.rs       CUDA offload of the Qwen3VL encoder's matrix multiplies
 src/vision/prompt.rs     image spans, placeholder expansion, token embeddings/positions
 ```
 
@@ -109,6 +110,14 @@ placeholder position `p0`; `t = p0`, `x = p0 + i % nx`, `y = p0 + i / nx`, `z = 
 - GPU image prompts: prefill on the CPU, copy the CPU state into the GPU's KV/recurrent buffers
   (`GpuModel::load_state`), then decode on the GPU. The CPU prefill does the full M-RoPE; the GPU only needs
   the text RoPE offset (`GpuModel::rope_offset`), so no CUDA/Vulkan M-RoPE kernel is needed.
+- GPU vision encoder (`src/vision/gpu.rs`): under `--gpu` the Qwen3-VL encoder runs its matrix multiplies
+  (patch convs, `attn_qkv`, `attn_out`, `ffn_up`, `ffn_down`, `mm.0`, `mm.2`) on CUDA through
+  `Backend::gemm_dense`, with `STRATA_VISION_CPU=1` (or a non-CUDA backend, or under 512 MB of free VRAM) as
+  the CPU fallback. One weight matrix is resident at a time, so the ~0.9 GB of F16 weights never has to fit
+  in VRAM beside the text model; the GEMM K step is 64, so rows are zero-padded to it. The patch gather,
+  LayerNorm, RoPE, the bidirectional softmax attention, the GELU and the bias adds stay on the CPU, so the
+  attention (~40 GFLOP for a 768x1056 image) still runs on the CPU. Weights and x are rounded to f16 inside
+  the GEMM (f32 accumulation), the same as the model's own prefill.
 - `tests/gpu_model.rs::gpu_image_prefill_matches_cpu` checks the CPU prefill logits against the GPU on
   CUDA and Vulkan, the KV-row/RoPE-offset split, and that decoding names the image color. It runs on the
   default model (whose sibling `mmproj-F16.gguf` is found by `find_sibling`) or `STRATA_MODEL`.
@@ -126,7 +135,9 @@ placeholder position `p0`; `t = p0`, `x = p0 + i % nx`, `y = p0 + i / nx`, `z = 
   prefix while the rendered conversation extends it, and decode greedily. `serve` is API-only (no web
   chat page) and rejects tools (the text template supports them, but the server does not parse calls yet);
   it needs `--model` because the `--models-dir` picker goes through `ModelConfig`.
-- Still to do: a GPU-native image prefill (chunked, with per-row M-RoPE) for long prompts.
+- Still to do: a GPU-native image prefill (chunked, with per-row M-RoPE) for long prompts, and a
+  bidirectional vision attention kernel (head_dim 72, no causal mask; the projector's attention is the part
+  still on the CPU in the GPU encoder).
 
 ## Validation
 
