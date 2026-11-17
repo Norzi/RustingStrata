@@ -2031,3 +2031,58 @@ fn router_topk_sigmoid_matches_cpu() {
         }
     }
 }
+
+/// `attn_vision`: the ViT's bidirectional attention against a direct CPU reference. 37 tokens is not a multiple of a
+/// block's 32, so the tail (and the warps whose 4 tokens run past `n`) are exercised, and `hd` 72 uses all three
+/// per-lane groups.
+#[test]
+fn vision_attention_matches_reference() {
+    let gen = |n: usize, s: f32| -> Vec<f32> { (0..n).map(|i| ((i as f32 + 1.0) * s).sin() * 0.5).collect() };
+    let (n, nh, hd) = (37usize, 3usize, 72usize);
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        eprintln!("backend {bk}");
+        let len = n * nh * hd;
+        let (q, k, v) = (gen(len, 0.7548777), gen(len, 0.5698403), gen(len, 0.4385791));
+        let (dq, dk, dv) = (up(g, &q), up(g, &k), up(g, &v));
+        let dy = g.zeros::<f32>(len).unwrap();
+        let scale = 1.0 / (hd as f32).sqrt();
+        if !g.vision_attn(dq.addr(), dk.addr(), dv.addr(), dy.addr(), n, nh, hd, scale).unwrap() {
+            eprintln!("SKIP: {bk} has no vision attention kernel");
+            continue;
+        }
+        let got = down::<f32>(g, &dy);
+        let mut want = vec![0f32; len];
+        for t in 0..n {
+            for h in 0..nh {
+                let base = (t * nh + h) * hd;
+                let s: Vec<f32> = (0..n).map(|j| {
+                    (0..hd).map(|d| q[base + d] * k[(j * nh + h) * hd + d]).sum::<f32>() * scale
+                }).collect();
+                let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let e: Vec<f32> = s.iter().map(|v| (v - m).exp()).collect();
+                let sum: f32 = e.iter().sum();
+                for d in 0..hd {
+                    want[base + d] = (0..n).map(|j| e[j] * v[(j * nh + h) * hd + d]).sum::<f32>() / sum;
+                }
+            }
+        }
+        let err = rel_l2(&got, &want);
+        eprintln!("vision_attention n {n} nh {nh} hd {hd}: rel err {err:.2e}");
+        assert!(err <= 1e-4, "attn_vision: rel err {err}");
+    }
+}
+
+/// The kernel is compiled for up to 96 floats a head: a wider head must ask for the CPU path, not launch.
+#[test]
+fn vision_attention_rejects_wide_heads() {
+    let (n, nh, hd) = (4usize, 1usize, 128usize);
+    let x = xs(n * nh * hd);
+    for (bk, gpu) in common::backends() {
+        let g = &*gpu;
+        let (dq, dk, dv) = (up(g, &x), up(g, &x), up(g, &x));
+        let dy = g.zeros::<f32>(x.len()).unwrap();
+        let wide = g.vision_attn(dq.addr(), dk.addr(), dv.addr(), dy.addr(), n, nh, hd, 0.5).unwrap();
+        assert!(!wide, "{bk} must not claim head_dim {hd}");
+    }
+}

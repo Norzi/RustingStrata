@@ -2909,6 +2909,66 @@ __device__ int block_scan(int v, int* tot) {
     return x - v + (w ? ws[w - 1] : 0);
 }
 
+// ---- vision encoder attention ----
+// The ViT's bidirectional attention: y[t][h] = softmax_j(scale * q[t][h] . k[j][h]) v[j][h] over every one of the `n`
+// patches, no mask and no causal step, head_dim <= 96 (Qwen3-VL: 16 heads x 72). q/k/v/y are [n][nh][hd] floats. One
+// warp serves VQ consecutive tokens of one head, so a key's K and V rows are read once for VQ queries; lane l holds
+// dimensions l, l + 32 and l + 64 of each of them. Online softmax (running max and sum, the same values in every lane).
+// grid = (nh, ceil(n / (8 * VQ))), block = 256.
+constexpr int VQ = 4;
+extern "C" __global__ void attn_vision(const float* __restrict__ q, const float* __restrict__ k,
+                                       const float* __restrict__ v, float* __restrict__ y,
+                                       int n, int nh, int hd, float scale) {
+    int lane = threadIdx.x & 31, h = blockIdx.x;
+    int t0 = (blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5)) * VQ;
+    if (t0 >= n) return;  // past the last token: nothing to load, and no barrier follows
+    const int d0 = lane, d1 = lane + 32, d2 = lane + 64;
+    const bool h0 = d0 < hd, h1 = d1 < hd, h2 = d2 < hd;
+    bool on[VQ];
+    float q0[VQ], q1[VQ], q2[VQ], o0[VQ], o1[VQ], o2[VQ], mx[VQ], sum[VQ];
+    #pragma unroll
+    for (int r = 0; r < VQ; r++) {
+        on[r] = t0 + r < n;
+        mx[r] = -1e30f; sum[r] = 0.0f;
+        const float* p = q + ((size_t)(t0 + r) * nh + h) * hd;
+        q0[r] = on[r] && h0 ? p[d0] : 0.0f;
+        q1[r] = on[r] && h1 ? p[d1] : 0.0f;
+        q2[r] = on[r] && h2 ? p[d2] : 0.0f;
+        o0[r] = o1[r] = o2[r] = 0.0f;
+    }
+    for (int j = 0; j < n; j++) {
+        const float* kp = k + ((size_t)j * nh + h) * hd;
+        float k0 = h0 ? kp[d0] : 0.0f, k1 = h1 ? kp[d1] : 0.0f, k2 = h2 ? kp[d2] : 0.0f;
+        float w[VQ];
+        #pragma unroll
+        for (int r = 0; r < VQ; r++) {
+            float s = warp_sum(q0[r] * k0 + q1[r] * k1 + q2[r] * k2) * scale;
+            if (!on[r]) { w[r] = 0.0f; continue; }
+            if (s > mx[r]) {  // new maximum: rescale the running sum and the accumulated output
+                float c = __expf(mx[r] - s);
+                sum[r] = sum[r] * c + 1.0f; mx[r] = s;
+                o0[r] *= c; o1[r] *= c; o2[r] *= c;
+                w[r] = 1.0f;
+            } else {
+                w[r] = __expf(s - mx[r]);
+                sum[r] += w[r];
+            }
+        }
+        const float* vp = v + ((size_t)j * nh + h) * hd;
+        float v0 = h0 ? vp[d0] : 0.0f, v1 = h1 ? vp[d1] : 0.0f, v2 = h2 ? vp[d2] : 0.0f;
+        #pragma unroll
+        for (int r = 0; r < VQ; r++) { o0[r] += w[r] * v0; o1[r] += w[r] * v1; o2[r] += w[r] * v2; }
+    }
+    #pragma unroll
+    for (int r = 0; r < VQ; r++) {
+        if (!on[r]) continue;
+        float* p = y + ((size_t)(t0 + r) * nh + h) * hd;
+        if (h0) p[d0] = o0[r] / sum[r];
+        if (h1) p[d1] = o1[r] / sum[r];
+        if (h2) p[d2] = o2[r] / sum[r];
+    }
+}
+
 // grid = rows, block = 1024: the top `top` blocks of row r by score (ties to the lower block), in block order.
 // mw = 0: sel row r (sst ints) = [cell count, cells...] with the 4 cells of each block, then the tail, or count -1
 // for a dense row. mw > 0: bit b of mask row r (mw words) set for each selected block and the tail block (all bits

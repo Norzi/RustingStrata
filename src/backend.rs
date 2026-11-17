@@ -169,6 +169,10 @@ pub trait Backend: Send {
     fn int8_gemm(&self, ty: GgmlType) -> bool;
     /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
     fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
+    /// Bidirectional (unmasked) vision-encoder attention over `n` tokens of `nh` heads of `hd` floats:
+    /// y[t][h][d] = softmax_j(scale * q[t][h]·k[j][h]) v[j][h]. `q`, `k`, `v` and `y` are [n][nh][hd] device floats.
+    /// False when this backend has no such kernel (the encoder then runs it on the CPU).
+    fn vision_attn(&self, _q: u64, _k: u64, _v: u64, _y: u64, _n: usize, _nh: usize, _hd: usize, _scale: f32) -> anyhow::Result<bool> { Ok(false) }
     fn prequant_gemm_x(&self, _w: &GpuTensor, _n: usize, _x: u64, _x_stride: usize) -> anyhow::Result<()> { Ok(()) }
     /// y = W x (all rows of `w`).
     fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()>;

@@ -64,6 +64,11 @@ impl VisionProjector {
 pub(crate) trait MatMul {
     /// `y[t * w.rows + r] = w[r] · x[t * w.cols..]` for `t < n`; with `add`, adds to `y` instead of replacing it.
     fn mm(&self, w: &Tensor, x: &[f32], n: usize, y: &mut [f32], add: bool) -> anyhow::Result<()>;
+    /// Bidirectional attention over all `n` tokens (`q`, `k`, `v` are [n][n_head*d_head]); None when the device has
+    /// no kernel for this shape, so the caller runs it on the CPU.
+    fn attn(&self, _q: &[f32], _k: &[f32], _v: &[f32], _n: usize, _n_head: usize, _d_head: usize, _scale: f32) -> anyhow::Result<Option<Vec<f32>>> {
+        Ok(None)
+    }
 }
 
 /// `w.matmul(x, n, y)` on `mm`, or on the CPU when `mm` is None.
@@ -77,6 +82,18 @@ fn mmul(mm: Option<&dyn MatMul>, w: &Tensor, x: &[f32], n: usize, y: &mut [f32],
         w.matmul(x, n, y);
     }
     Ok(())
+}
+
+/// The ViT's bidirectional attention on `mm` when the device has a kernel for it, else on the CPU.
+fn attn(mm: Option<&dyn MatMul>, q: &[f32], k: &[f32], v: &[f32], n: usize, n_head: usize, d_head: usize, scale: f32) -> Vec<f32> {
+    if let Some(m) = mm {
+        match m.attn(q, k, v, n, n_head, d_head, scale) {
+            Ok(Some(o)) => return o,
+            Ok(None) => {}
+            Err(e) => eprintln!("image: the GPU vision attention failed ({e:#}); running it on the CPU"),
+        }
+    }
+    attention(q, k, v, n, n_head, d_head, scale)
 }
 
 fn merge_shape(c: &ClipConfig, img: &PreprocessedImage) -> anyhow::Result<(usize, usize, usize, usize)> {
@@ -181,12 +198,13 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
         let mut q = vec![0f32; n_patches * n_embd];
         let mut k = vec![0f32; n_patches * n_embd];
         let mut v = vec![0f32; n_patches * n_embd];
-        for t in 0..n_patches {
-            let row = &qkv[t * 3 * n_embd..(t + 1) * 3 * n_embd];
-            q[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row[..n_embd]);
-            k[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row[n_embd..2 * n_embd]);
-            v[t * n_embd..(t + 1) * n_embd].copy_from_slice(&row[2 * n_embd..]);
-        }
+        q.par_chunks_mut(n_embd).zip(k.par_chunks_mut(n_embd)).zip(v.par_chunks_mut(n_embd)).enumerate()
+            .for_each(|(t, ((qs, ks), vs))| {
+                let row = &qkv[t * 3 * n_embd..(t + 1) * 3 * n_embd];
+                qs.copy_from_slice(&row[..n_embd]);
+                ks.copy_from_slice(&row[n_embd..2 * n_embd]);
+                vs.copy_from_slice(&row[2 * n_embd..]);
+            });
         q.par_chunks_mut(n_embd).enumerate().for_each(|(t, row)| {
             let dx = t % m;
             let dy = (t / m) % m;
@@ -204,13 +222,13 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
             for h in row.chunks_exact_mut(c.d_head) { ops::rope_vision(h, py, px, base); }
         });
 
-        let attn = attention(&q, &k, &v, n_patches, c.n_head, c.d_head, scale);
+        let heads = attn(mm, &q, &k, &v, n_patches, c.n_head, c.d_head, scale);
         let wo_w = p.model.tensor(&format!("v.blk.{il}.attn_out.weight"))?;
         let wo_b = p.model.tensor(&format!("v.blk.{il}.attn_out.bias"))?;
         let mut attn_out = vec![0f32; n_patches * n_embd];
-        mmul(mm, &wo_w, &attn, n_patches, &mut attn_out, false)?;
+        mmul(mm, &wo_w, &heads, n_patches, &mut attn_out, false)?;
         add_bias_rows(&mut attn_out, &wo_b, n_embd);
-        for (a, b) in x.iter_mut().zip(&attn_out) { *a += *b; }
+        x.par_iter_mut().zip(attn_out.par_iter()).for_each(|(a, b)| *a += *b);
 
         let h = layer_norm_all(&x, n_embd, &ln2w, &ln2b, c.eps);
         let up_w = p.model.tensor(&format!("v.blk.{il}.ffn_up.weight"))?;
@@ -224,7 +242,7 @@ fn encode_qwen3vl(p: &VisionProjector, img: &PreprocessedImage, mm: Option<&dyn 
         let mut down = vec![0f32; n_patches * n_embd];
         mmul(mm, &down_w, &up, n_patches, &mut down, false)?;
         add_bias_rows(&mut down, &down_b, n_embd);
-        for (a, b) in x.iter_mut().zip(&down) { *a += *b; }
+        x.par_iter_mut().zip(down.par_iter()).for_each(|(a, b)| *a += *b);
     }
 
     // 5. post-layernorm.
