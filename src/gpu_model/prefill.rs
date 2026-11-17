@@ -24,6 +24,8 @@ pub(super) struct Scratch {
     feat: Option<Buf>,
     /// ids | xrow | inv, `chunk * k` each.
     ints: Buf,
+    /// `[chunk, 4]` M-RoPE positions for an image prompt's chunk (unused for text).
+    mropes: Buf,
     tiles: Buf,
     staging: Buf,
 }
@@ -67,13 +69,13 @@ impl Scratch {
             chunk, lay: Lay { h, a, b, c: c2, d, e, rl, wts, ge, ye, shg, shy, sg, xn, lo, hg, pk, pq, pg, pn, pv, inj, mix, mo, emb },
             slab: gpu.zeros::<f32>(total)?,
             feat: if c.eagle3.is_some() { Some(gpu.zeros::<f32>(3 * ne * chunk)?) } else { None },
-            ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
+            ints: gpu.zeros::<i32>(3 * chunk * k)?, mropes: gpu.zeros::<i32>(4 * chunk)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
         })
     }
 
     /// Bytes of VRAM this scratch takes.
-    pub fn bytes(&self) -> usize { self.slab.len() + self.feat.as_ref().map_or(0, Buf::len) + self.ints.len() + self.tiles.len() + self.staging.len() }
+    pub fn bytes(&self) -> usize { self.slab.len() + self.feat.as_ref().map_or(0, Buf::len) + self.ints.len() + self.mropes.len() + self.tiles.len() + self.staging.len() }
 }
 
 impl GpuModel<'_> {
@@ -109,13 +111,18 @@ impl GpuModel<'_> {
         let nchunks = tokens.len().div_ceil(chunk);
         for (i, ch) in tokens.chunks(chunk).enumerate() {
             if i > 0 { between(self)?; }
-            self.prefill_chunk(ch, None)?;
+            self.prefill_chunk(ch, None, None, None)?;
             if every > 0 && (i + 1) % every == 0 && i + 1 < nchunks { self.adapt_experts()?; }
         }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
         self.adapt_experts()?;
         // Serve: place the prompt's experts for the prefill, then let decode follow the reply's own routing.
         if self.reset_counts_after_prefill { self.reset_counts(); }
+        self.prefill_logits()
+    }
+
+    /// The logits after a prefill: normalize the last hidden state (row 0 of `x`) and run the output projection.
+    pub(super) fn prefill_logits(&mut self) -> anyhow::Result<Vec<f32>> {
         let s = self.tail();
         let (g, ne) = (&s.gpu, s.m.cfg.n_embd);
         let h = s.bufs["h"].addr();
@@ -131,7 +138,7 @@ impl GpuModel<'_> {
 
     /// Move the hot missed experts into VRAM (all parts of a split model). A fully resident cache has no hot missed
     /// expert to place: skip the scan over all its entries (issue #34 R2).
-    fn adapt_experts(&mut self) -> anyhow::Result<()> {
+    pub(super) fn adapt_experts(&mut self) -> anyhow::Result<()> {
         let adapt = self.adapt_every > 0;
         let mut p = Some(&mut *self);
         while let Some(q) = p {
@@ -180,7 +187,10 @@ impl GpuModel<'_> {
     /// The start of `prefill_cached`: return to the longest state (saved, stashed or parked) that `tokens[..keep]`
     /// continues, and return its length.
     fn cache_begin(&mut self, tokens: &[u32], keep: usize) -> anyhow::Result<usize> {
-        let (hit, own) = (self.saved_ids.len(), self.owner);
+        // A state saved by an image prompt carries its content hash, not its tokens; only `prefill_image` may take it
+        // back (a text prompt must never continue it, whatever its ids say).
+        let (mut hit, own) = (self.saved_ids.len(), self.owner);
+        if self.saved_image.is_some() { hit = 0; }
         let stashed = self.sys.as_ref().filter(|_| self.sys_owner == own).map_or(0, |s| if tokens[..keep].starts_with(&s.3) { s.3.len() } else { 0 });
         let extends = hit > 0 && hit >= stashed && self.saved_owner == own && tokens[..keep].starts_with(&self.saved_ids);
         // The longest parked state this prompt continues, if it beats the saved one and the stash.
@@ -206,6 +216,41 @@ impl GpuModel<'_> {
         // brings its own KV, which may have been computed in other chunks.
         if best.is_some() || stashed == 0 && self.sys.as_ref().is_some_and(|s| reused < s.3.len()) { self.sys = None; }
         Ok(reused)
+    }
+
+    /// Prefill `p.ids[from..to]` of an image prompt in chunks, on the tensor-core GEMMs: image tokens take the
+    /// projector's rows (`embs[i]` holds image i), text tokens are embedded, and every token's M-RoPE positions come
+    /// from `p.positions`. Needs the prefill scratch and `Backend::has_rope_mrope_rows`.
+    pub(super) fn prefill_image_span(&mut self, p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>], from: usize, to: usize)
+        -> anyhow::Result<()> {
+        anyhow::ensure!(from <= to && to <= p.ids.len(), "image prefill: {from}..{to} of {}", p.ids.len());
+        let chunk = self.pf.as_ref().map_or(0, |pf| pf.chunk);
+        anyhow::ensure!(chunk > 0, "image prefill needs the prefill scratch");
+        anyhow::ensure!(to <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
+        anyhow::ensure!(embs.len() == p.images.len(), "{} image embedding(s) for {} image span(s)", embs.len(), p.images.len());
+        // The image row of each prompt index, if the token is an image token.
+        let mut at: Vec<Option<(usize, usize)>> = vec![None; p.ids.len()];
+        for (i, span) in p.images.iter().enumerate() {
+            anyhow::ensure!(embs[i].len() == span.n_tokens(), "image {i}: {} rows for a {}x{} token grid", embs[i].len(), span.width, span.height);
+            for k in 0..span.n_tokens() { at[span.start + k] = Some((i, k)); }
+        }
+        let ne = self.m.cfg.n_embd;
+        for a in (from..to).step_by(chunk) {
+            let b = (a + chunk).min(to);
+            // A chunk with an image token takes all its rows precomputed; a text chunk embeds.
+            let rows = if at[a..b].iter().any(Option::is_some) {
+                let mut v = Vec::with_capacity((b - a) * ne);
+                for (i, slot) in at[a..b].iter().enumerate() {
+                    match slot {
+                        Some((im, r)) => v.extend_from_slice(&embs[*im][*r]),
+                        None => v.extend_from_slice(&self.m.embed(p.ids[a + i])),
+                    }
+                }
+                Some(v)
+            } else { None };
+            self.prefill_chunk(&p.ids[a..b], None, rows.as_deref(), Some(&p.positions[a..b]))?;
+        }
+        Ok(())
     }
 
     /// `prefill_cached` for several slots in shared forwards (models with `batch_cap`): `jobs` holds (slot, owner,
@@ -275,26 +320,48 @@ impl GpuModel<'_> {
         Ok(logits)
     }
 
-    /// `input`: the hidden rows and PLE input from the part before (None: embed `toks`).
-    fn prefill_chunk(&mut self, toks: &[u32], input: Option<(&[f32], &[f32])>) -> anyhow::Result<()> {
+    /// `input`: the hidden rows and PLE input from the part before. `rows`: the precomputed embedding rows of `toks`
+    /// (an image prompt: image tokens take the projector's rows, text tokens are embedded here). `pos4`: one
+    /// `[t, y, x, z]` M-RoPE position per token (None: the linear positions of `step_buf`).
+    fn prefill_chunk(&mut self, toks: &[u32], input: Option<(&[f32], &[f32])>, rows: Option<&[f32]>, pos4: Option<&[[i32; 4]]>) -> anyhow::Result<()> {
         // Missed experts are read from the mapped weights in the order the staging copies take them.
         let pre = self.cache.is_some().then(Prefetch::start);
         let owned: (Vec<f32>, Vec<f32>);
         let (emb, pe): (&[f32], &[f32]) = match input {
             Some(v) => v,
             None => {
+                let ne = self.m.cfg.n_embd;
                 let hcn = self.m.cfg.hc_n.max(1);
                 let pe = if self.ple_ring.is_some() { toks.iter().flat_map(|&tk| self.m.ple_embed(&mut self.ple_prev, tk)).collect() } else { vec![] };
-                owned = (toks.iter().flat_map(|&tk| self.m.embed(tk).repeat(hcn)).collect(), pe);
+                let emb = match rows {
+                    Some(r) if hcn == 1 => r.to_vec(),
+                    Some(r) => r.chunks(ne).flat_map(|x| x.repeat(hcn)).collect(),
+                    None => toks.iter().flat_map(|&tk| self.m.embed(tk).repeat(hcn)).collect(),
+                };
+                owned = (emb, pe);
                 (&owned.0, &owned.1)
             }
         };
         let c = &self.m.cfg;
+        if let Some(ps) = pos4 { anyhow::ensure!(ps.len() == toks.len(), "prefill: {} positions for {} tokens", ps.len(), toks.len()); }
+        let sec = match (pos4, c.mrope_sections) {
+            (Some(_), Some(s)) => Some(s),
+            (Some(_), None) => anyhow::bail!("image prompt: the model has no M-RoPE sections"),
+            _ => None,
+        };
         let pf = self.pf.as_ref().unwrap();
         let (g, mut t, n, eps, ne) = (&self.gpu, toks.len(), pf.chunk, c.eps, c.n_embd);
         let d = c.hc_n.max(1) * ne;
         g.put(emb, &pf.slab, 0)?;
         if !pe.is_empty() { g.put(pe, &pf.slab, pf.lay.emb)?; }
+        let mrope = match pos4 {
+            Some(ps) => {
+                let tab: Vec<i32> = ps.iter().flat_map(|p| *p).collect();
+                g.put(&tab, &pf.mropes, 0)?;
+                Some(pf.mropes.addr())
+            }
+            None => None,
+        };
         g.put(&[self.pos as i32, 0], &self.step_buf, 0)?;
         g.put(&[self.pos as i32 + self.rope_offset, 0], &self.rope_buf, 0)?;
         let mut step = self.step_buf.addr();
@@ -312,7 +379,7 @@ impl GpuModel<'_> {
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
         // The draft head runs as one more layer on the chunk while it is in step with the main model.
-        let fill = self.mtp_synced();
+        let fill = self.mtp_synced() && sec.is_none();
         let is_eagle = self.mtp.as_ref().is_some_and(|mh| mh.eagle.is_some());
         // ponytail: the chunked prefill does not fill a hyper-connection draft head (it starts without the prompt:
         // lower acceptance at first, same output). Fill it as one more hc layer here if that costs speed.
@@ -399,11 +466,21 @@ impl GpuModel<'_> {
                     let use_rope = c.rope_layer.get(il).copied().unwrap_or(true);
                     g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
                     g.rms_norm(at(l.a), qs, qn.ptr, at(l.b), hd, hd, t * nh, eps)?;
-                    if use_rope { g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, rope, c.rope_base)?; }
+                    if use_rope {
+                        match (mrope, sec) {
+                            (Some(tab), Some(s)) => g.rope_mrope_rows(at(l.b), hd, nh, t, c.n_rot, tab, c.rope_base, s)?,
+                            _ => g.rope_neox(at(l.b), hd, t * nh, nh, c.n_rot, rope, c.rope_base)?,
+                        }
+                    }
                     g.gemm_dense(k, t, h, ne, kraw, kv, SAME_X)?;
                     g.gemm_dense(v, t, h, ne, vv, kv, SAME_X)?;
                     g.rms_norm(kraw, hd, kn.ptr, kk, hd, hd, t * nkv, eps)?;
-                    if use_rope { g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, rope, c.rope_base)?; }
+                    if use_rope {
+                        match (mrope, sec) {
+                            (Some(tab), Some(s)) => g.rope_mrope_rows(kk, hd, nkv, t, c.n_rot, tab, c.rope_base, s)?,
+                            _ => g.rope_neox(kk, hd, t * nkv, nkv, c.n_rot, rope, c.rope_base)?,
+                        }
+                    }
                     g.kv_store(kk, vv, kc[self.cur].addr(), vc[self.cur].addr(), kv, t, step, hd)?;
                     // QSA: region c (free after kv_store) holds the raw indexer keys, raw queries and normed queries.
                     let (qm, mw) = match (qsa, &self.qsa) {
@@ -641,7 +718,7 @@ impl GpuModel<'_> {
         self.pos += toks.len();
         let Some(nx) = self.next.as_deref_mut() else { return Ok(()) };
         let xs = self.gpu.get::<f32>(&self.pf.as_ref().unwrap().slab, 0, toks.len() * d)?;
-        nx.prefill_chunk(toks, Some((&xs, pe)))
+        nx.prefill_chunk(toks, Some((&xs, pe)), None, pos4)
     }
 
     /// `step_rows` for up to `batch_cap` distinct slots, on the GEMM kernels of prefill: one decode step a row, each

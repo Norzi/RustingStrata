@@ -33,6 +33,19 @@ fn gq_min(pos: usize, nt: usize) -> i32 {
 }
 
 
+/// A hash of an image prompt's content: its grids and every projector row. Image tokens all share one token id, so
+/// the ids cannot tell two images apart; a cached prefill may only be reused when this matches too.
+fn image_sig(p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |x: u64| { h = (h ^ x).wrapping_mul(0x0000_0100_0000_01b3); };
+    for s in &p.images { eat(s.start as u64); eat(s.width as u64); eat(s.height as u64); }
+    for e in embs {
+        eat(e.len() as u64);
+        for r in e { eat(r.len() as u64); for &v in r { eat(v.to_bits() as u64); } }
+    }
+    h
+}
+
 mod prefill;
 
 /// A tensor `GpuModel::load_part` never uploads: the PLE table stays on the CPU.
@@ -167,7 +180,7 @@ struct MtpHead {
 
 /// What a slot keeps while another slot is current (`use_slot`): the `GpuModel` fields of the same names.
 #[derive(Default)]
-struct Seq { pos: usize, saved: Vec<(Buf, Buf)>, saved_pos: usize, saved_ids: Vec<u32>, saved_owner: u64, sys: Option<Stash>, sys_owner: u64 }
+struct Seq { pos: usize, saved: Vec<(Buf, Buf)>, saved_pos: usize, saved_ids: Vec<u32>, saved_owner: u64, saved_image: Option<u64>, sys: Option<Stash>, sys_owner: u64 }
 
 /// See `GpuModel::sys`.
 type Stash = (Vec<Vec<u8>>, usize, [i64; 2], Vec<u32>);
@@ -217,6 +230,9 @@ pub struct GpuModel<'a> {
     saved_pos: usize,
     /// The tokens behind the saved state when `prefill_cached` saved it (else empty).
     saved_ids: Vec<u32>,
+    /// Content hash of the image whose prefill saved the state, when it was an image prompt (`saved_ids` alone cannot
+    /// tell two images apart: all image tokens share the `<|image_pad|>` id). None for a text state.
+    saved_image: Option<u64>,
     /// Host copy of the saved state at the end of the system prompt (`stash`): buffers, position, PLE tokens, the
     /// tokens behind it. A request whose history no longer extends the saved one (a rewritten or compacted
     /// conversation) restarts from it.
@@ -611,13 +627,14 @@ impl<'a> GpuModel<'a> {
         let adapt_every = std::env::var("STRATA_ADAPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let adapt_swaps = std::env::var("STRATA_ADAPT_SWAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, prompt_cache_path: None, bt, mtp, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], saved_owner: 0, saved_image: None, sys: None, parked: vec![], owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, prompt_cache_path: None, bt, mtp, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0 })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
     pub fn reset(&mut self) -> anyhow::Result<()> {
         self.saved_ids.clear();
+        self.saved_image = None;
         self.sys = None;
         if let Some(h) = self.mtp.as_mut() { h.pos = 0; h.pend.clear(); h.adapt_window = 0x0FFF; h.adapt_skip = 0; }
         if let Some(ng) = self.ngram.as_mut() { ng.reset(); }
@@ -634,27 +651,71 @@ impl<'a> GpuModel<'a> {
         Ok(())
     }
 
-    /// Run an image prompt as a fresh sequence and return its last logits: text tokens through `step`, image tokens
-    /// through `step_embed` with their M-RoPE positions. `step` then uses the RoPE offset for text past the image.
+    /// Run an image prompt and return its last logits: the prompt runs in chunks on the tensor-core prefill, image
+    /// tokens with the projector's rows and every token with its own M-RoPE positions. A state saved by an earlier
+    /// turn of the same image is continued instead of prefilled again, so a chat keeps its image across messages.
     pub fn prefill_image(&mut self, p: &crate::vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
         let c = &self.m.cfg;
         ensure!(c.n_embd_ple == 0 && c.idx_top_k == 0, "image input is not supported for this model yet ({} with PLE or QSA layers)", c.arch);
-        self.reset()?;
+        ensure!(p.ids.len() == p.positions.len(), "image prompt: {} tokens, {} positions", p.ids.len(), p.positions.len());
+        ensure!(p.ids.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
+        let mrope_sections = c.mrope_sections;
+        let sig = image_sig(p, embs);
         self.rows.clear();
-        self.parked.clear();
         // The draft head has not seen the image rows; image prompts decode without MTP.
         self.tail_mut().mtp = None;
-        let mut rows = p.images.iter().zip(embs).flat_map(|(span, e)| (span.start..).zip(e)).peekable();
+        // Continue the state saved by the previous turn when it is the same image and its tokens are this prompt's
+        // prefix (a chat's history grows; the image stays where it was).
+        let keep = p.ids.len().saturating_sub(1);
+        let reused = if self.saved_image == Some(sig) && self.saved_owner == self.owner
+            && !self.saved_ids.is_empty() && self.saved_ids.len() <= keep && p.ids.starts_with(&self.saved_ids) {
+            let n = self.saved_ids.len();
+            self.restore_state()?;
+            n
+        } else {
+            self.reset()?;
+            self.parked.clear();
+            0
+        };
+        // The image row of each prompt index, for the one-token-a-forward fallback below.
+        let mut at: Vec<Option<(usize, usize)>> = vec![None; p.ids.len()];
+        for (i, span) in p.images.iter().enumerate() {
+            for k in 0..span.n_tokens() { at[span.start + k] = Some((i, k)); }
+        }
+        if self.pf.is_some() && self.gpu.has_rope_mrope_rows() && mrope_sections.is_some() {
+            self.prefill_image_span(p, embs, reused, keep)?;
+            if keep > reused { self.save_image_state(&p.ids[..keep], sig)?; }
+            self.prefill_image_span(p, embs, keep, p.ids.len())?;
+            self.adapt_experts()?;
+            self.rope_offset = p.next_position - self.pos as i32;
+            return self.prefill_logits();
+        }
+        // One token a forward (the CPU, or a backend without the batched M-RoPE kernel).
         let mut logits = Vec::new();
-        // ponytail: one token per forward (decode speed); a batched prefill needs M-RoPE in the prefill kernels.
-        for (i, &id) in p.ids.iter().enumerate() {
-            logits = match rows.next_if(|r| r.0 == i) {
-                Some((_, x)) => self.step_embed(x, p.positions[i])?,
-                None => { self.rope_offset = p.positions[i][0] - self.pos as i32; self.step(id)? }
+        for i in reused..keep {
+            logits = match at[i] {
+                Some((im, r)) => self.step_embed(&embs[im][r], p.positions[i])?,
+                None => { self.rope_offset = p.positions[i][0] - self.pos as i32; self.step(p.ids[i])? }
+            };
+        }
+        if keep > reused { self.save_image_state(&p.ids[..keep], sig)?; }
+        for i in keep..p.ids.len() {
+            logits = match at[i] {
+                Some((im, r)) => self.step_embed(&embs[im][r], p.positions[i])?,
+                None => { self.rope_offset = p.positions[i][0] - self.pos as i32; self.step(p.ids[i])? }
             };
         }
         self.rope_offset = p.next_position - self.pos as i32;
         Ok(logits)
+    }
+
+    /// Save the state behind `ids` as the one a later turn of the same image (`sig`) continues.
+    fn save_image_state(&mut self, ids: &[u32], sig: u64) -> anyhow::Result<()> {
+        self.save_state()?;
+        self.saved_ids = ids.to_vec();
+        self.saved_owner = self.owner;
+        self.saved_image = Some(sig);
+        Ok(())
     }
 
     /// `step` for an image token: `x` is its embedding (a projector row), `pos` its M-RoPE positions [t, y, x, z].
@@ -688,6 +749,7 @@ impl<'a> GpuModel<'a> {
         std::mem::swap(&mut self.saved_pos, &mut q.saved_pos);
         std::mem::swap(&mut self.saved_ids, &mut q.saved_ids);
         std::mem::swap(&mut self.saved_owner, &mut q.saved_owner);
+        std::mem::swap(&mut self.saved_image, &mut q.saved_image);
         std::mem::swap(&mut self.sys, &mut q.sys);
         std::mem::swap(&mut self.sys_owner, &mut q.sys_owner);
         self.seqs[self.cur] = q;
@@ -934,6 +996,7 @@ impl<'a> GpuModel<'a> {
         self.saved_ple_prev = self.ple_prev;
         self.saved_pos = self.pos;
         self.saved_ids.clear();
+        self.saved_image = None;
         if let Some(n) = self.next.as_mut() { n.save_state()?; }
         Ok(())
     }
@@ -954,6 +1017,7 @@ impl<'a> GpuModel<'a> {
         while let Some(q) = p {
             let data = q.slot().iter().map(|b| q.gpu.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
             q.saved_ids = ids.to_vec();
+            q.saved_image = None;
             q.sys = Some((data, q.saved_pos, q.saved_ple_prev, q.saved_ids.clone()));
             (q.saved_owner, q.sys_owner) = (q.owner, q.owner);
             p = q.next.as_deref_mut();
@@ -1189,6 +1253,8 @@ impl<'a> GpuModel<'a> {
             for (b, d) in m.slot().iter().zip(&c.slot) { m.gpu.put(d, b, 0)?; }
             for (b, d) in m.kv_bufs().iter().zip(&c.kv) { m.gpu.put(d, b, 0)?; }
             (m.saved_pos, m.saved_ple_prev, m.saved_ids, m.saved_owner) = (p.ids.len(), c.ple_prev, p.ids.clone(), p.owner);
+            // `Parked` does not carry the image hash: never treat a parked state as an image state.
+            m.saved_image = None;
             q = m.next.as_deref_mut();
         }
         self.restore_state()
@@ -1201,6 +1267,7 @@ impl<'a> GpuModel<'a> {
             let s = q.sys.as_ref().ok_or_else(|| anyhow::anyhow!("unstash without stash"))?;
             for (b, d) in q.slot().iter().zip(&s.0) { q.gpu.put(d, b, 0)?; }
             (q.saved_pos, q.saved_ple_prev, q.saved_ids, q.saved_owner) = (s.1, s.2, s.3.clone(), q.sys_owner);
+            q.saved_image = None;
             p = q.next.as_deref_mut();
         }
         self.restore_state()

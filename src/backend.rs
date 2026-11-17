@@ -249,6 +249,15 @@ pub trait Backend: Send {
         }
         Ok(())
     }
+    /// M-RoPE for a whole batch: `rows` tokens of `per` heads (`heads` rows), token r turns section s of its pairs
+    /// by `pos[4 * r + s]` (`sections` as in `rope_mrope`). Every token has its own positions, so a prefill chunk of
+    /// image tokens (whose positions follow the image grid, not the token index) runs in one launch a layer.
+    fn rope_mrope_rows(&self, _x: u64, _stride: usize, _per: usize, _rows: usize, _n_rot: usize, _pos: u64, _base: f32,
+                       _sections: [usize; 4]) -> anyhow::Result<()> {
+        anyhow::bail!("this backend has no batched M-RoPE kernel")
+    }
+    /// Whether `rope_mrope_rows` runs (CUDA; the other backends prefill image tokens one at a time).
+    fn has_rope_mrope_rows(&self) -> bool { false }
     /// `rms_norm` of `rows` heads of n (output rows of n), then `rope_neox` on them.
     fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
         self.rms_norm(x, x_stride, w, out, n, n, rows, eps)?;

@@ -1090,6 +1090,16 @@ fn norm_rope_and_gate_ops_match_cpu() {
         for v in want.chunks_mut(hd) { ops::rope_mrope(v, n_rot, mpos, sec, 1e7) }
         let got = down::<f32>(gpu, &dx);
         close(&got, &want, "rope_mrope");
+        // rope_mrope_rows: 3 tokens, each with its own positions [t, y, x, z], 2 heads each.
+        let mposs = [[40, 7, 13, 5], [41, 8, 12, 5], [42, 7, 11, 5]];
+        let dx = up(gpu, &x[..6 * hd]);
+        let tab = up(gpu, &mposs.iter().flat_map(|p| *p).collect::<Vec<i32>>());
+        gpu.rope_mrope_rows(dx.addr(), hd, 2, 3, n_rot, tab.addr(), 1e7, sec).unwrap();
+        let mut want = x[..6 * hd].to_vec();
+        for (h, v) in want.chunks_mut(hd).enumerate() { ops::rope_mrope(v, n_rot, mposs[h / 2], sec, 1e7) }
+        let got = down::<f32>(gpu, &dx);
+        close(&got, &want, "rope_mrope_rows");
+        report("rope_mrope_rows", "3 tokens x 2 heads, own positions", &got, &want);
         // rms_norm_rope == rms_norm then rope_neox, from rows 160 floats apart.
         let dx = up(gpu, &x[..6 * 160]);
         let (d1, d2) = (gpu.zeros::<f32>(6 * hd).unwrap(), gpu.zeros::<f32>(6 * hd).unwrap());

@@ -16,10 +16,14 @@ LayerNorms, x/y position tables, unweighted RMS norm, `mm.input_projection`) is 
 `llama-mtmd-debug -p encode` with the 0.8B unified mmproj. GLM-4V and DeepSeek-OCR have no matching text
 forward in this repo and stay rejected.
 
-GPU image prompts prefill on the CPU (`vision::feed_prompt` with `Model::step_embed`), upload the KV and
-recurrent state into `GpuModel::load_state`, and decode on the GPU. The GPU's RoPE position is decoupled
-from the KV row through `GpuModel::rope_offset`/`rope_buf`, so text after an image resumes at the
-projector's `next_position` while the cache row stays contiguous. Gemma 4 uses normal RoPE and is
+GPU image prompts prefill on the GPU's tensor-core chunked prefill (`GpuModel::prefill_image`), with the
+projector's rows for image tokens and a per-token M-RoPE position table (`rope_mrope_rows` in kernels.cu).
+The KV row stays contiguous while the RoPE position follows the image grid, and text after the image
+resumes at the projector's `next_position` through `GpuModel::rope_offset`/`rope_buf`. A chat keeps the
+image across turns: `prefill_image` continues the state saved by the previous turn when its ids are a prefix
+of the new prompt and an image-content hash (`saved_image`) matches, so the image is prefilled once.
+Backends without the batched M-RoPE kernel (Vulkan, CPU) fall back to one token a forward through
+`step_embed`. Gemma 4 uses normal RoPE and is
 wired through `generate`, `chat` and `serve`; `generate` is raw completion, so a chat-tuned Gemma 4
 needs the template in `--prompt` (or use `chat`), while `chat`/`serve` apply it. GLM-4V/DeepSeek-OCR need a matching text forward before
 their projectors can be used.
@@ -77,7 +81,10 @@ The mmproj metadata is `clip.projector_type=qwen3vl_merger`, `clip.vision.image_
 Pipeline:
 
 1. Smart resize: preserve aspect ratio, align to `patch_size * merge = 32`, keep pixel count in
-   `[8*32*32, 4096*32*32]`; bilinear resize with align-corners like `mtmd_image.cpp`.
+   `[8*32*32, 4096*32*32]`; bilinear resize with align-corners like `mtmd_image.cpp`. For Qwen3-VL and
+   GLM-4V the merged-token grid is then capped at 1200 tokens and 40 a side (`ClipConfig::resize`,
+   `STRATA_VISION_MAX_TOKENS` / `STRATA_VISION_MAX_SIDE`), i.e. about 30x40 tokens for a photo; the Gemma
+   projectors keep their own 40..280 range.
 2. Normalize RGB to `(v/255 - mean) / std`, keep interleaved RGB `[w][h][c]`.
 3. Patch conv 16x16 stride 16, two convs summed; add patch bias. Tensor `v.patch_embd.weight` is
    `[16,16,3,1024]` and `.1` the same, row order `(kx, ky, c)`.
@@ -107,9 +114,14 @@ placeholder position `p0`; `t = p0`, `x = p0 + i % nx`, `y = p0 + i / nx`, `z = 
 - `serve` parses OpenAI `image_url` blocks and Anthropic `image` blocks (base64 or URL); `Msg` carries the
   image URLs and the template renders one `<image>` placeholder per image. The chat page has an attach
   button, drag/paste, previews and sends `image_url` blocks with the message.
-- GPU image prompts: prefill on the CPU, copy the CPU state into the GPU's KV/recurrent buffers
-  (`GpuModel::load_state`), then decode on the GPU. The CPU prefill does the full M-RoPE; the GPU only needs
-  the text RoPE offset (`GpuModel::rope_offset`), so no CUDA/Vulkan M-RoPE kernel is needed.
+- GPU image prompts: `GpuModel::prefill_image` runs the prompt on the tensor-core chunked prefill, a chunk
+  at a time. A chunk with image tokens is fed the projector's rows; other chunks embed normally. Every
+  token carries its `[t, y, x, z]` M-RoPE position (`Prompt::positions`), uploaded as one table per chunk
+  and applied by `rope_mrope_rows`, so no per-token round trip and no CPU prefill. The chunk's last hidden
+  state goes through `prefill_logits` (output norm + projection). MTP is disabled on image prompts (the
+  draft head has not seen the image rows). The state after the prompt-minus-last-token is saved with the
+  image's content hash; the next chat turn restores it and prefills only the new suffix. A backend
+  without `rope_mrope_rows` (Vulkan, CPU) still prefills one token a forward via `step_embed`.
 - GPU vision encoder (`src/vision/gpu.rs`): under `--gpu` the Qwen3-VL encoder runs its matrix multiplies
   (patch convs, `attn_qkv`, `attn_out`, `ffn_up`, `ffn_down`, `mm.0`, `mm.2`) and the ViT's bidirectional
   attention on CUDA, with `STRATA_VISION_CPU=1` (or a non-CUDA backend, or under 512 MB of free VRAM) as the
@@ -148,7 +160,7 @@ placeholder position `p0`; `t = p0`, `x = p0 + i % nx`, `y = p0 + i / nx`, `z = 
   prefix while the rendered conversation extends it, and decode greedily. `serve` is API-only (no web
   chat page) and rejects tools (the text template supports them, but the server does not parse calls yet);
   it needs `--model` because the `--models-dir` picker goes through `ModelConfig`.
-- Still to do: a GPU-native image prefill (chunked, with per-row M-RoPE) for long prompts. The vision
+- Done: GPU-native image prefill (chunked, with per-row M-RoPE) and cross-turn image state reuse. The vision
   encoder's remaining CPU work is the patch gather, LayerNorm, RoPE, GELU and bias adds (the attention and
   every matmul are on the GPU now).
 

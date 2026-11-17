@@ -1580,6 +1580,23 @@ extern "C" __global__ void rope_neox(float* x, int stride, int per, int n_rot, c
     }
 }
 
+// grid = rows, block = n_rot / 2. Like rope_neox, but token r's section s of the pairs turns by its own position
+// pos[4 * r + s] (image prompts: [t, y, x, z] a token). e0..e2: cumulative pair ends of sections 0..2.
+extern "C" __global__ void rope_mrope_rows(float* x, int stride, int per, int n_rot, const int* pos, float base,
+                                           int e0, int e1, int e2) {
+    int r = blockIdx.x, i = threadIdx.x, half = n_rot / 2;
+    if (i >= half) return;
+    int sec = i < e0 ? 0 : i < e1 ? 1 : i < e2 ? 2 : 3;
+    double theta = (double)pos[4 * r + sec] * pow((double)base, -2.0 * i / n_rot);
+    float s = (float)sin(theta), c = (float)cos(theta);
+    for (int hd = 0; hd < per; hd++) {
+        float* h = x + (size_t)(r * per + hd) * stride;
+        float a = h[i], b = h[i + half];
+        h[i] = a * c - b * s;
+        h[i + half] = a * s + b * c;
+    }
+}
+
 extern "C" __global__ void add(float* x, const float* y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];

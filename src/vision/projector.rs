@@ -5,7 +5,7 @@
 //! projector's merge factor and normalizes with the mmproj's mean/std.
 
 use crate::ops;
-use crate::vision::image::{PreprocessedImage, Rgb, resize_bilinear, resize_bilinear_antialias_f32, smart_resize};
+use crate::vision::image::{PreprocessedImage, Rgb, resize_bilinear, resize_bilinear_antialias_f32};
 use crate::vision::mmproj::{ClipConfig, ClipModel, FfnKind, ProjectorKind};
 use crate::weights::Tensor;
 use anyhow::{Context, bail};
@@ -28,7 +28,7 @@ impl VisionProjector {
     /// Smart resize and normalize an RGB image for this projector.
     pub fn preprocess(&self, img: &Rgb) -> anyhow::Result<PreprocessedImage> {
         let c = &self.model.cfg;
-        let (w, h) = smart_resize(img.width() as usize, img.height() as usize, c.merge_align(), c.image_min_pixels, c.image_max_pixels);
+        let (w, h) = c.resize(img.width() as usize, img.height() as usize);
         let resized = resize_bilinear(img, w, h);
         PreprocessedImage::from_u8(w, h, resized.as_raw(), c.image_mean, c.image_std)
     }
@@ -36,7 +36,7 @@ impl VisionProjector {
     /// Number of merged image tokens and the token grid (`nx, ny`), without running the encoder.
     pub fn count_tokens(&self, width: usize, height: usize) -> anyhow::Result<(usize, usize)> {
         let c = &self.model.cfg;
-        let (w, h) = smart_resize(width, height, c.merge_align(), c.image_min_pixels, c.image_max_pixels);
+        let (w, h) = c.resize(width, height);
         let nx = w / c.merge_align();
         let ny = h / c.merge_align();
         anyhow::ensure!(nx > 0 && ny > 0, "image resized to {w}x{h}, too small for patch {}", c.merge_align());

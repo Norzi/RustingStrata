@@ -56,6 +56,9 @@ pub struct ClipConfig {
     pub use_gelu: bool,
     pub image_min_pixels: usize,
     pub image_max_pixels: usize,
+    /// Most merged tokens an image may resize to (0: no cap), and most merged tokens a side (0: no side cap).
+    pub image_max_tokens: usize,
+    pub image_max_side: usize,
     pub deepstack: Vec<bool>,
 }
 
@@ -107,8 +110,15 @@ impl ClipConfig {
         };
         let patch_area = patch_size * patch_size * n_merge * n_merge;
         let (min_tok, max_tok) = match kind { ProjectorKind::Gemma4V | ProjectorKind::Gemma4Uv => (40, 280), _ => (8, 4096) };
+        // Cap the merged-token grid a Qwen3-VL/GLM-4V image resizes to: 1200 tokens is about 30x40 (40 a side at most),
+        // and both the encoder and the text model's image prefill grow with it. STRATA_VISION_MAX_TOKENS and
+        // STRATA_VISION_MAX_SIDE override; the Gemma projectors keep their own range.
+        let env_usize = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+        let qwen = !matches!(kind, ProjectorKind::Gemma4V | ProjectorKind::Gemma4Uv);
+        let image_max_tokens = if qwen { env_usize("STRATA_VISION_MAX_TOKENS").unwrap_or(1200) } else { max_tok };
+        let image_max_side = if qwen { env_usize("STRATA_VISION_MAX_SIDE").unwrap_or(40) } else { 0 };
         let image_min_pixels = opt_u("clip.vision.image_min_pixels").unwrap_or(min_tok * patch_area);
-        let image_max_pixels = opt_u("clip.vision.image_max_pixels").unwrap_or(max_tok * patch_area);
+        let image_max_pixels = opt_u("clip.vision.image_max_pixels").unwrap_or(max_tok * patch_area).min(image_max_tokens * patch_area);
         let deepstack = match g.get("clip.vision.is_deepstack_layers") {
             Ok(v) => v.as_arr().context("clip.vision.is_deepstack_layers")?.iter().map(|x| matches!(x, Value::Bool(true))).collect(),
             Err(_) => vec![],
@@ -139,12 +149,30 @@ impl ClipConfig {
             use_gelu,
             image_min_pixels,
             image_max_pixels,
+            image_max_tokens,
+            image_max_side,
             deepstack,
         })
     }
 
     /// Pixels per side of the 2x2 spatial merge, i.e. the resize alignment.
     pub fn merge_align(&self) -> usize { self.patch_size * self.n_merge }
+
+    /// The size an image is resized to: `smart_resize` to the pixel range, then the merged-token grid scaled down to
+    /// `image_max_tokens` and `image_max_side` (0: no cap), keeping the aspect ratio and the resize alignment.
+    pub fn resize(&self, width: usize, height: usize) -> (usize, usize) {
+        let a = self.merge_align();
+        let (w, h) = crate::vision::image::smart_resize(width, height, a, self.image_min_pixels, self.image_max_pixels);
+        let (mut nx, mut ny) = (w / a, h / a);
+        if nx == 0 || ny == 0 { return (w, h); }
+        let mut s = 1.0f64;
+        if self.image_max_tokens > 0 { s = s.min((self.image_max_tokens as f64 / (nx * ny) as f64).sqrt()); }
+        if self.image_max_side > 0 { s = s.min(self.image_max_side as f64 / nx.max(ny) as f64); }
+        if s >= 1.0 { return (w, h); }
+        nx = ((nx as f64 * s).floor() as usize).max(1);
+        ny = ((ny as f64 * s).floor() as usize).max(1);
+        (nx * a, ny * a)
+    }
 }
 
 fn arr3_f32(g: &Gguf, key: &str) -> anyhow::Result<[f32; 3]> {
