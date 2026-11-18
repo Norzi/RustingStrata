@@ -99,6 +99,9 @@ pub trait Backend: Send {
     /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when
     /// recording, so its ops must read per-call values from device memory.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
+    /// Drop every recorded graph: the device addresses they embed may be gone (an expert pool freed for the vision
+    /// encoder and re-allocated somewhere else comes back at another address).
+    fn forget_graphs(&self) {}
     /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
     /// barriers between them); ops after the batch see all their results.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }

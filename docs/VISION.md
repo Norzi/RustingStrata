@@ -148,6 +148,14 @@ placeholder position `p0`; `t = p0`, `x = p0 + i % nx`, `y = p0 + i / nx`, `z = 
   (default 4, 0 disables). A chat resends its history, images included, on every request, so the same image is
   encoded once; attaching a new image encodes only the new one. `serve` accepts bodies up to 64 MiB, and the web page
   downscales attachments to a 1280 px side (JPEG) before sending them, since the model sees at most a 30x40 grid.
+- The VRAM the encoder needs does not sit idle between images: when a projector is configured (`--mmproj` or a
+  sibling mmproj, `STRATA_VISION_MMPROJ`), all but 256 MB of `--vram-margin` becomes a separate expert-slot pool
+  holding the hottest layers of the largest slot-size class (`ExpertCache::new`), and a serve request that misses the
+  encoder cache frees that pool (`GpuModel::lend_out`), encodes with its own CUDA context, and puts the experts back
+  from host RAM right after (`lend_back`). Freeing the pool drops the recorded CUDA graphs (`Backend::forget_graphs`),
+  since the slots may come back at another address. The load log prints
+  `vision loan: N MB of expert slots are freed while an image is encoded`, and each encode prints how much came back
+  and how long the re-upload took.
 - `tests/gpu_model.rs::gpu_image_prefill_matches_cpu` checks the CPU prefill logits against the GPU on
   CUDA and Vulkan, the KV-row/RoPE-offset split, and that decoding names the image color. It runs on the
   default model (whose sibling `mmproj-F16.gguf` is found by `find_sibling`) or `STRATA_MODEL`.

@@ -25,6 +25,21 @@ pub struct LayerExperts {
 
 struct Pool { buf: Buf, slot_bytes: usize, owner: Vec<(usize, usize)> }
 
+/// The loan the vision encoder borrows: a pool holding the experts of the hottest layers, freed while an image is
+/// encoded (`lend_out`) so the encoder's device buffers fit beside the model, and filled again right after
+/// (`lend_back`). The experts come back from the model's host memory, so nothing is copied out.
+#[derive(Clone, Copy)]
+pub struct Lend {
+    /// Index in `pools`.
+    pool: usize,
+    /// Pool of the class the loan was taken from.
+    class: usize,
+    /// Layers whose experts this pool holds (they use no other pool).
+    layers: usize,
+    /// Slots the pool has when it is in VRAM.
+    slots: usize,
+}
+
 pub struct ExpertCache {
     pools: Vec<Pool>,
     layers: Vec<Option<LayerExperts>>,
@@ -46,6 +61,8 @@ pub struct ExpertCache {
     /// Whether `record` ran since the load: a fully resident run records nothing and must not rewrite the profile.
     recorded: bool,
     pub swaps: usize,
+    /// The vision loan, when some of the VRAM margin was turned into expert slots (see `Lend`).
+    lend: Option<Lend>,
 }
 
 /// Where routing profiles and calibration files live: `$XDG_CACHE_HOME`, `%LOCALAPPDATA%` on Windows, else
@@ -63,8 +80,9 @@ fn profile_path(m: &Model) -> PathBuf {
 
 impl ExpertCache {
     /// Allocate slots worth at most `budget` bytes for the layers in `range` (up to n_layer, or n_layer + 1 with the
-    /// MTP layer) and fill them from the saved routing profile, or in layer order.
-    pub fn new(m: &Model, gpu: &dyn Backend, budget: usize, range: std::ops::Range<usize>) -> anyhow::Result<ExpertCache> {
+    /// MTP layer) and fill them from the saved routing profile, or in layer order. `lend_bytes` is VRAM the caller
+    /// leaves to the vision encoder: it becomes a pool of its own (`lend_out` frees it while an image is encoded).
+    pub fn new(m: &Model, gpu: &dyn Backend, budget: usize, range: std::ops::Range<usize>, lend_bytes: usize) -> anyhow::Result<ExpertCache> {
         let n_layers = range.end;
         let c = &m.cfg;
         let n = c.n_expert;
@@ -91,7 +109,7 @@ impl ExpertCache {
             layers.push(Some((pid, mats)));
         }
         let total: usize = pool_specs.iter().map(|(b, k)| b * k).sum();
-        let mut frac = (budget as f64 / total.max(1) as f64).min(1.0);
+        let frac = (budget as f64 / total.max(1) as f64).min(1.0);
         let profile = std::env::var_os("STRATA_FIXED_EXPERTS").is_none().then(|| profile_path(m));
         let counts = profile.as_ref().and_then(|p| std::fs::read(p).ok())
             .filter(|b| b.len() >= 4 * c.n_layer * n)
@@ -104,18 +122,48 @@ impl ExpertCache {
         let steady = (c.n_expert_used * 8) as f32 / (1.0 - KEEP);
         let counts: Vec<f32> = long.chunks(n.max(1)).flat_map(|l| { let s = l.iter().sum::<f32>(); l.iter().map(move |x| if s > 0.0 { x * steady / s } else { 0.0 }) }).collect();
 
+        // The vision loan: the hottest layers of the largest class get a pool of their own, sized from the VRAM
+        // margin. They hold the experts the placement keeps resident anyway, so turning the margin into slots costs
+        // the placement nothing, and `lend_out` gives the encoder their VRAM back for the length of an encode.
+        let mut specs = pool_specs.clone();
+        let mut lend = None;
+        if lend_bytes > 0 && let Some(cid) = specs.iter().enumerate().max_by_key(|&(_, &(_, k))| k).map(|(i, _)| i) {
+            let (slot_bytes, _) = specs[cid];
+            let class: Vec<usize> = (0..layers.len())
+                .filter(|&il| layers[il].as_ref().is_some_and(|(p, _)| *p == cid)).collect();
+            // Slots a layer of this class gets from the budget, and the loan's slots (all of them, if they fit).
+            let per = (frac * n as f64) as usize;
+            let want = (lend_bytes / slot_bytes.max(1)).min(class.len() * n);
+            if want > 0 && !class.is_empty() {
+                let j = if per == 0 { class.len() } else { want.div_ceil(per).clamp(1, class.len()) };
+                let hot = |il: usize| long[il * n..(il + 1) * n].iter().sum::<f32>();
+                let mut hot_layers = class;
+                hot_layers.sort_by(|&a, &b| hot(b).total_cmp(&hot(a)).then(a.cmp(&b)));
+                let id = specs.len();
+                specs.push((slot_bytes, j * n));
+                for &il in &hot_layers[..j] { if let Some((p, _)) = layers[il].as_mut() { *p = id; } }
+                lend = Some(Lend { pool: id, class: cid, layers: j, slots: want });
+            }
+        }
+
         // The budget comes from the driver's free-memory estimate, which can be more than it will allocate (AMD's
         // Windows driver): on a failed allocation, free the pools and try a tenth less.
+        let mut f = frac;
         let pools = loop {
-            let r = pool_specs.iter().map(|&(slot_bytes, k)| {
-                let slots = (frac * k as f64) as usize;
+            let mut slots: Vec<usize> = specs.iter().map(|&(_, k)| (f * k as f64) as usize).collect();
+            if let Some(x) = &lend {
+                // The loan's layers take their slots from its pool, not from the budgeted one.
+                slots[x.class] = slots[x.class].saturating_sub((f * (x.layers * n) as f64) as usize);
+                slots[x.pool] = x.slots;
+            }
+            let r = specs.iter().zip(&slots).map(|(&(slot_bytes, _), &slots)| {
                 Ok(Pool { buf: gpu.zeros::<u8>(slots * slot_bytes)?, slot_bytes, owner: Vec::with_capacity(slots) })
             }).collect::<anyhow::Result<Vec<_>>>();
             match r {
                 Ok(p) => break p,
-                Err(e) if frac > 0.01 => {
-                    eprintln!("expert slots: {e:#}; trying {:.0} MB", 0.9 * frac * total as f64 / 1048576.0);
-                    frac *= 0.9;
+                Err(e) if f > 0.01 => {
+                    eprintln!("expert slots: {e:#}; trying {:.0} MB", 0.9 * f * total as f64 / 1048576.0);
+                    f *= 0.9;
                 }
                 Err(e) => return Err(e),
             }
@@ -131,7 +179,7 @@ impl ExpertCache {
             });
         }
         let prompt = vec![0.0; counts.len()];
-        let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, long, prompt, steady, profile, recorded: false, swaps: 0 };
+        let mut cache = ExpertCache { pools, layers: out, n_expert: n, counts, long, prompt, steady, profile, recorded: false, swaps: 0, lend };
         // Initial fill: hottest first by profile; ties (and no profile) keep layer order.
         let mut order: Vec<usize> = (0..n_layers * n).filter(|&i| cache.layers[i / n].is_some()).collect();
         order.sort_by(|&a, &b| cache.counts[b].total_cmp(&cache.counts[a]).then(a.cmp(&b)));
@@ -185,6 +233,65 @@ impl ExpertCache {
     pub fn resident(&self, il: usize, e: usize) -> bool { self.layers[il].as_ref().is_some_and(|l| l.table[e] >= 0) }
     pub fn resident_count(&self) -> usize { self.pools.iter().map(|p| p.owner.len()).sum() }
     pub fn slot_bytes_total(&self) -> usize { self.pools.iter().map(|p| p.buf.len()).sum() }
+
+    /// Bytes the loan holds while it is in VRAM (0 without one): what freeing it makes room for.
+    pub fn lend_bytes(&self) -> usize { self.lend.map_or(0, |l| self.pools[l.pool].buf.len()) }
+
+    /// Free the loan pool so the vision encoder's buffers fit in its VRAM: its experts' tables go to -1 (they run on
+    /// the CPU meanwhile, which is fine because no forward runs while an image is encoded) and nothing reads the freed
+    /// slots. Returns the experts that left, for `lend_back`.
+    pub fn lend_out(&mut self, gpu: &dyn Backend) -> anyhow::Result<Vec<(usize, usize)>> {
+        let Some(l) = self.lend else { return Ok(Vec::new()) };
+        let bytes = self.pools[l.pool].buf.len();
+        if bytes == 0 { return Ok(Vec::new()); }
+        // Nothing queued may still read the pool, and graphs hold its addresses.
+        gpu.sync()?;
+        let out = std::mem::take(&mut self.pools[l.pool].owner);
+        let mut touched = Vec::new();
+        for &(il, e) in &out {
+            if let Some(lx) = self.layers[il].as_mut() { lx.table[e] = -1; touched.push(il); }
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for il in touched { self.sync_table(gpu, il)?; }
+        self.pools[l.pool].buf = Buf::new(0, 0, ());
+        gpu.forget_graphs();
+        eprintln!("vision loan: {:.0} MB of expert slots freed for the encoder", bytes as f64 / 1048576.0);
+        Ok(out)
+    }
+
+    /// Give the loan back: allocate its slots again and put the experts `lend_out` took into them, re-reading them
+    /// from the model's host memory. A failed allocation leaves those layers on the CPU (logged) until the model is
+    /// loaded again.
+    pub fn lend_back(&mut self, m: &Model, gpu: &dyn Backend, out: &[(usize, usize)]) -> anyhow::Result<()> {
+        let Some(l) = self.lend else { return Ok(()) };
+        if self.pools[l.pool].buf.len() > 0 { return Ok(()) }
+        let slot_bytes = self.pools[l.pool].slot_bytes;
+        let n = if out.is_empty() { l.slots } else { out.len().min(l.slots) };
+        match gpu.zeros::<u8>(n * slot_bytes) {
+            Ok(b) => self.pools[l.pool].buf = b,
+            Err(e) => {
+                eprintln!("expert slots: the {:.0} MB vision loan could not come back ({e:#}); {} layers run on the \
+                    CPU until the model is loaded again", (n * slot_bytes) as f64 / 1048576.0, l.layers);
+                return Ok(());
+            }
+        }
+        self.pools[l.pool].owner.clear();
+        let mut touched = Vec::new();
+        let t0 = std::time::Instant::now();
+        for (i, &(il, e)) in out.iter().take(n).enumerate() {
+            self.pools[l.pool].owner.push((il, e));
+            self.place(m, gpu, il, e, i, false)?;
+            touched.push(il);
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for il in touched { self.sync_table(gpu, il)?; }
+        gpu.sync()?;
+        eprintln!("vision loan: {:.0} MB of expert slots back in VRAM ({:.2} s)", (n * slot_bytes) as f64 / 1048576.0,
+            t0.elapsed().as_secs_f64());
+        Ok(())
+    }
     pub fn total_experts(&self) -> usize { self.layers.iter().flatten().count() * self.n_expert }
 
     /// Every expert of every layer of this cache is in VRAM: no routing can miss, so the CPU worker, the mailbox and
@@ -256,6 +363,8 @@ impl ExpertCache {
     fn swap(&mut self, m: &Model, gpu: &dyn Backend, max_swaps: usize) -> anyhow::Result<()> {
         let n = self.n_expert;
         for p in 0..self.pools.len() {
+            // The vision loan is out: its layers are on the CPU and it has no slots to swap into.
+            if self.pools[p].buf.len() == 0 { continue; }
             let mut hot: Vec<usize> = (0..self.counts.len())
                 .filter(|&i| self.layers[i / n].as_ref().is_some_and(|l| l.pool == p && l.table[i % n] < 0)).collect();
             smallest(&mut hot, max_swaps, |&a, &b| self.counts[b].total_cmp(&self.counts[a]));
@@ -332,7 +441,8 @@ mod tests {
             table_dev: Buf::new(0, 4 * n, ()),
         })).collect();
         let mut c = ExpertCache { pools: vec![pool], layers: ls, n_expert: n, counts: vec![0.0; layers * n],
-            long: vec![0.0; layers * n], prompt: vec![0.0; layers * n], steady: 1.0, profile, recorded: false, swaps: 0 };
+            long: vec![0.0; layers * n], prompt: vec![0.0; layers * n], steady: 1.0, profile, recorded: false, swaps: 0,
+            lend: None };
         for il in 0..layers {
             for e in 0..resident {
                 c.pools[0].owner.push((il, e));

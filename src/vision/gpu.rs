@@ -407,6 +407,43 @@ fn weight_row_into(w: &Tensor, r: usize, out: &mut [f32]) {
     }
 }
 
+/// Encode `img` with this encoder's own device (None on the CPU).
+impl VisionGpu {
+    pub fn encode(&self, p: &VisionProjector, img: &Rgb) -> anyhow::Result<(Vec<Vec<f32>>, usize, usize)> {
+        encode_image(p, img, Some(self))
+    }
+}
+
+/// A vision encoder with a device of its own: the CUDA context is opened on the first image and dropped with it, so a
+/// run that sends no images keeps that VRAM. Used by the `--image` paths and by serve requests, whose runner lends it
+/// expert slots to make room when it has them (`GpuModel::lend_out`) and takes them back when the encode is done.
+pub struct Owned {
+    device: Option<usize>,
+    gpu: Option<VisionGpu>,
+    tried: bool,
+}
+
+impl Owned {
+    pub fn new(device: Option<usize>) -> Owned { Owned { device, gpu: None, tried: false } }
+
+    /// Encode `img` on the GPU when the device opened and the projector has a GPU path, on the CPU otherwise (decided
+    /// once, on the first image; the context is dropped with the `Owned`).
+    pub fn encode(&mut self, p: &VisionProjector, img: &Rgb) -> anyhow::Result<(Vec<Vec<f32>>, usize, usize)> {
+        if !self.tried {
+            // Only the Qwen3-VL encoder has a GPU path; the Gemma projectors stay on the CPU.
+            self.gpu = match p.cfg().kind {
+                ProjectorKind::Qwen3Vl => VisionGpu::open(self.device),
+                _ => None,
+            };
+            self.tried = true;
+        }
+        match &self.gpu {
+            Some(g) => g.encode(p, img),
+            None => encode_image(p, img, None),
+        }
+    }
+}
+
 /// Run the Qwen3-VL encoder for `img` on the GPU when `gpu` is given (and on any GPU error, with a warning), else
 /// on the CPU. Returns the merged image tokens and their grid.
 pub fn encode_image(projector: &VisionProjector, img: &Rgb, gpu: Option<&VisionGpu>) -> anyhow::Result<(Vec<Vec<f32>>, usize, usize)> {

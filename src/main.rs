@@ -366,6 +366,12 @@ impl Engine {
         for n in notes { eprintln!("{n}"); }
         (self.parallel, self.mtp) = (parallel, Some(mtp));
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
+        // An image may arrive (a serve request, or a `--image` on the command line): the VRAM margin then becomes a
+        // pool of expert slots the encoder borrows (`ExpertCache::new`, read by `load_part`). Without a projector the
+        // margin stays free VRAM, as `--vram-margin` promises.
+        if self.mmproj.is_some() || vision::find_sibling(model).is_some() {
+            unsafe { std::env::set_var("STRATA_VISION_MMPROJ", "1") }
+        }
         // Before the first weight is uploaded: fail if a pipeline these weight types need does not fit the device's
         // shared memory (Vulkan; a no-op elsewhere). No pipeline or model buffer exists yet.
         let types = rusting_strata::gpu_model::gpu_weight_types(&m.w.g);
@@ -492,15 +498,26 @@ fn cpu_topology_groups(dir: &std::path::Path) -> usize {
     groups.len()
 }
 
-/// Decode and encode every image with the projector at `mmproj`. `device` is the GPU the encoder runs on (None: the
-/// CPU). Results are cached by image source and projector (`vision::cache`): a chat resends its history, images
-/// included, on every request, so an image that was already encoded is not encoded again.
+/// Decode and encode every image with the projector at `mmproj`, on a device of the encoder's own. `device` is the GPU
+/// it opens (None: the CPU). Results are cached by image source and projector (`vision::cache`): a chat resends its
+/// history, images included, on every request, so an image that was already encoded is not encoded again.
 fn load_images(mmproj: &Path, images: &[String], device: Option<usize>) -> anyhow::Result<ImageInput> {
+    let mut own = vision::gpu::Owned::new(device);
+    load_images_on(mmproj, images, &mut |p, img| own.encode(p, img))
+}
+
+/// `load_images` with the encode itself left to `enc` (projector, decoded image → merged tokens and grid). The
+/// projector is opened on the first image that misses the cache, so a turn whose images were all encoded before
+/// touches neither the GGUF nor the device.
+fn load_images_on(
+    mmproj: &Path,
+    images: &[String],
+    enc: &mut dyn FnMut(&VisionProjector, &vision::Rgb) -> anyhow::Result<(Vec<Vec<f32>>, usize, usize)>,
+) -> anyhow::Result<ImageInput> {
     let keys: Vec<u64> = images.iter().map(|s| vision::cache::key(mmproj, s)).collect();
     let mut grids = Vec::with_capacity(images.len());
     let mut embeddings = Vec::with_capacity(images.len());
-    // The projector and its GPU encoder are opened once, on the first image that misses the cache.
-    let mut enc: Option<(VisionProjector, Option<vision::gpu::VisionGpu>)> = None;
+    let mut proj: Option<VisionProjector> = None;
     for (src, &key) in images.iter().zip(&keys) {
         if let Some((grid, feats)) = vision::cache::get(key) {
             eprintln!("image: {}x{} tokens (cached)", grid.0, grid.1);
@@ -508,25 +525,45 @@ fn load_images(mmproj: &Path, images: &[String], device: Option<usize>) -> anyho
             embeddings.push(feats);
             continue;
         }
-        if enc.is_none() {
-            let pr = VisionProjector::open(mmproj)?;
-            // Only the Qwen3-VL encoder has a GPU path; the Gemma projectors stay on the CPU.
-            let g = match pr.cfg().kind {
-                vision::ProjectorKind::Qwen3Vl => vision::gpu::VisionGpu::open(device),
-                _ => None,
-            };
-            enc = Some((pr, g));
-        }
-        let (p, gpu) = { let e = enc.as_ref().unwrap(); (&e.0, e.1.as_ref()) };
+        if proj.is_none() { proj = Some(VisionProjector::open(mmproj)?); }
+        let p = proj.as_ref().unwrap();
         let img = vision::load_image(src)?;
         let t0 = Instant::now();
-        let (feats, nx, ny) = vision::gpu::encode_image(p, &img, gpu)?;
+        let (feats, nx, ny) = enc(p, &img)?;
         eprintln!("image: {nx}x{ny} tokens encoded in {:.1} s", t0.elapsed().as_secs_f64());
         vision::cache::put(key, (nx, ny), &feats);
         grids.push((nx, ny));
         embeddings.push(feats);
     }
     Ok(ImageInput { grids, embeddings })
+}
+
+/// Encode a serve request's images. A GPU runner lends its expert slots to the encoder for the length of the encode
+/// (`GpuModel::lend_out`): the slots come back from host memory right after, so the VRAM margin is not reserved for
+/// the projector while no image is in flight. A slot runner has no GPU of its own, so the encoder opens one (and it
+/// is dropped at the end of the request).
+fn encode_request_images(r: &mut Runner, mmproj: &Path, images: &[String], device: Option<usize>) -> anyhow::Result<ImageInput> {
+    let mut own = vision::gpu::Owned::new(device);
+    let g = match r {
+        Runner::Gpu(g) => &mut **g,
+        _ => return load_images_on(mmproj, images, &mut |p, img| own.encode(p, img)),
+    };
+    let mut loans = Vec::new();
+    let mut lent = false;
+    let input = load_images_on(mmproj, images, &mut |p, img| {
+        // Only a cache miss reaches here, so the loan (and the re-upload when it comes back) is paid for a request
+        // that really encodes an image on the device.
+        if !lent && matches!(p.cfg().kind, vision::ProjectorKind::Qwen3Vl) {
+            lent = true;
+            loans = g.lend_out()?;
+        }
+        own.encode(p, img)
+    });
+    // Back in even when the encode failed: the layers run on the CPU until then. The encoder's context goes first:
+    // its VRAM is what the slots are allocated from.
+    drop(own);
+    if lent { g.lend_back(&loans)?; }
+    input
 }
 
 /// Expand `<image>` placeholders into the projector's vision tokens and assign M-RoPE positions.
@@ -996,17 +1033,18 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 std::io::stdin().read_to_string(&mut s)?;
                 s
             } else { prompt };
+            let mut r = engine.runner(&m, &model)?;
             let vision_prompt = if image.is_empty() {
                 None
             } else {
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
-                let input = load_images(mmproj, &image, engine.vision_device())?;
+                // After the model: the encoder takes the runner's lent expert slots for the encode.
+                let input = encode_request_images(&mut r, mmproj, &image, engine.vision_device())?;
                 Some((build_image_prompt(&tok, &input, &image, &prompt)?, input))
             };
             let ids = tok.encode(&prompt)?;
             anyhow::ensure!(!ids.is_empty() || vision_prompt.is_some(), "empty prompt");
-            let mut r = engine.runner(&m, &model)?;
             let t0 = Instant::now();
             let (logits, n_prompt) = match vision_prompt {
                 None => (r.prefill(&ids)?, ids.len()),
@@ -1192,12 +1230,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let aux_g = open_mtp_gguf(engine.mtp_model.as_deref())?;
             let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
+            let mut r = engine.runner(&m, &model)?;
             let image_input = if image.is_empty() { None } else {
                 let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
-                Some(load_images(mmproj, &image, engine.vision_device())?)
+                Some(encode_request_images(&mut r, mmproj, &image, engine.vision_device())?)
             };
-            let mut r = engine.runner(&m, &model)?;
             let mut smp = engine.sampler();
             let tpl = template(&g);
             let mut msgs: Vec<Msg> = system.iter().map(|s| Msg::new("system", s)).collect();
@@ -2271,7 +2309,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     let n = if images.is_empty() { l.tok.encode(&prompt)?.len() } else {
                         let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
                         let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
-                        let input = load_images(mmproj, &images, e.vision_device())?;
+                        let input = encode_request_images(&mut l.r, mmproj, &images, e.vision_device())?;
                         build_image_prompt(l.tok, &input, &images, &prompt)?.ids.len()
                     };
                     send(&mut w, "200 OK", json!({"input_tokens": n}))
@@ -2302,7 +2340,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let image_input = if images.is_empty() { None } else {
                 let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
                 let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
-                Some(load_images(mmproj, &images, e.vision_device())?)
+                Some(encode_request_images(r, mmproj, &images, e.vision_device())?)
             };
             let vision_prompt = match &image_input {
                 Some(input) => Some(build_image_prompt(tok, input, &images, &prompt)?),

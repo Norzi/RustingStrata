@@ -594,7 +594,20 @@ impl<'a> GpuModel<'a> {
             // backend comparison, or other programs holding VRAM).
             let cap = std::env::var("STRATA_EXPERT_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |v| v << 20);
             let budget = free1.saturating_sub(vram_margin).min(cap);
-            Some(ExpertCache::new(m, &*gpu, budget, range.start..range.end + (mtp && c.eagle3.is_none()) as usize)?)
+            // The margin is not left idle: whatever the cache does not take becomes a loan of expert slots that the
+            // vision encoder borrows while it encodes (`GpuModel::lend_out`). 256 MB stays free for the driver, and
+            // the loan stops at 2 GB so a huge margin does not turn into a huge re-upload per image. Only with a
+            // projector (`STRATA_VISION_MMPROJ`): without one, `--vram-margin` stays free VRAM.
+            let margin_left = free1.saturating_sub(budget).min(vram_margin);
+            let lend = if std::env::var_os("STRATA_VISION_MMPROJ").is_some() {
+                margin_left.saturating_sub(256 << 20).min(2048 << 20)
+            } else { 0 };
+            let cache = ExpertCache::new(m, &*gpu, budget, range.start..range.end + (mtp && c.eagle3.is_none()) as usize, lend)?;
+            if cache.lend_bytes() > 0 {
+                eprintln!("vision loan: {:.0} MB of expert slots are freed while an image is encoded ({:.0} MB of the margin stays free)",
+                    cache.lend_bytes() as f64 / 1048576.0, margin_left.saturating_sub(lend) as f64 / 1048576.0);
+            }
+            Some(cache)
         } else { None };
         let moe_layers: Vec<usize> = range.clone().filter(|&il| c.is_moe_layer(il)).collect();
         let worker = if !moe_layers.is_empty() { Some(CpuWorker::new(m, &*gpu, moe_layers)?) } else { None };
@@ -835,6 +848,36 @@ impl<'a> GpuModel<'a> {
 
     /// This part and the parts after it.
     pub fn parts(&self) -> impl Iterator<Item = &GpuModel<'a>> { std::iter::successors(Some(self), |p| p.next.as_deref()) }
+
+    /// The part `d` links after this one (`lend_back` addresses the loans by depth).
+    fn part_mut(&mut self, d: usize) -> &mut GpuModel<'a> {
+        let mut p = self;
+        for _ in 0..d { p = p.next.as_deref_mut().expect("part index past the last part"); }
+        p
+    }
+
+    /// Free the expert slots lent to the vision encoder, on every part: the encoder's device buffers fit in their
+    /// place while it runs, and `lend_back` puts the experts back. Returns what left, per part.
+    pub fn lend_out(&mut self) -> anyhow::Result<Vec<(usize, Vec<(usize, usize)>)>> {
+        let GpuModel { gpu, cache, next, .. } = self;
+        let mut out = Vec::new();
+        if let Some(c) = cache.as_mut() { out.push((0, c.lend_out(&**gpu)?)); }
+        if let Some(n) = next.as_deref_mut() {
+            out.extend(n.lend_out()?.into_iter().map(|(d, left)| (d + 1, left)));
+        }
+        Ok(out)
+    }
+
+    /// Take the loan back after the encoder is done: its slots are allocated again and the experts re-read from the
+    /// model's host memory.
+    pub fn lend_back(&mut self, loans: &[(usize, Vec<(usize, usize)>)]) -> anyhow::Result<()> {
+        for (d, left) in loans {
+            let p = self.part_mut(*d);
+            let GpuModel { m, gpu, cache, .. } = p;
+            if let Some(c) = cache.as_mut() { c.lend_back(*m, &**gpu, left)?; }
+        }
+        Ok(())
+    }
 
     /// The part that computes the logits.
     fn tail(&self) -> &GpuModel<'a> { self.parts().last().unwrap() }

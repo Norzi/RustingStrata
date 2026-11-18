@@ -38,7 +38,11 @@ built-in checks.
   `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
 - `--vram-margin` MB of VRAM left free. One value applies to every device; `512,256` gives one per device in
   `--device` order, and `0:512,1:256` gives one per GPU index. On a GPU that drives no display, `--vram-margin 256` keeps more experts
-  resident (+1-2% prefill); 128 runs out of memory.
+  resident (+1-2% prefill); 128 runs out of memory. With an `--mmproj` (or a sibling mmproj next to the model) the
+  margin itself is not idle: all but 256 MB of it becomes expert slots of the hottest layers, which the vision encoder
+  borrows back while it encodes an image and returns to the model right after (see [VISION.md](VISION.md)). That means
+  `--vram-margin` can be set for the encoder's peak (~1300 MB on the reference machine) without giving up those expert
+  slots between images; without a projector the margin stays free VRAM.
 - `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower 32K prefill.
 - `--allowed-hosts ai-server.lan` (or `STRATA_ALLOWED_HOSTS`) allows a LAN name when `serve` is bound to `0.0.0.0`.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).

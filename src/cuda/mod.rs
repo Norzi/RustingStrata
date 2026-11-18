@@ -831,6 +831,10 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    /// Drop every recorded graph: an expert pool it was captured with may have been freed and re-allocated elsewhere
+    /// (the vision loan), and the ports of a recorded launch are baked in.
+    fn forget_graphs(&self) { self.graphs.lock().unwrap().clear(); }
+
     /// Pinned host memory mapped into the device address space.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
         let n = words.max(1);
